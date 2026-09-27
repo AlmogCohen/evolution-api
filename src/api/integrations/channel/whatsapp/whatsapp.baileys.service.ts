@@ -113,6 +113,7 @@ import makeWASocket, {
   isJidBroadcast,
   isJidGroup,
   isJidNewsletter,
+  isLidUser,
   isPnUser,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
@@ -928,6 +929,56 @@ export class BaileysStartupService extends ChannelStartupService {
       //const usersContacts = contactsRaw.filter((c) => c.remoteJid.includes('@s.whatsapp'));
     },
   };
+
+  /**
+   * Tell consumers which phone number a private @lid belongs to: one CONTACTS_UPSERT
+   * item per pair, { remoteJid: <phone>, pushName: null, lid, phoneNumber: <phone> }.
+   */
+  private lidMappingHandle(mappings: { lid?: string; pn?: string }[]) {
+    const seen = new Set<string>();
+    const contacts = [];
+    for (const m of mappings ?? []) {
+      let [lid, pn] = [m?.lid, m?.pn];
+      if (isLidUser(pn) && isPnUser(lid)) [lid, pn] = [pn, lid];
+      if (!isLidUser(lid) || !isPnUser(pn)) continue;
+      [lid, pn] = [jidNormalizedUser(lid), jidNormalizedUser(pn)];
+      if (!lid || !pn || seen.has(`${lid}|${pn}`)) continue;
+      seen.add(`${lid}|${pn}`);
+      contacts.push({ remoteJid: pn, pushName: null, lid, phoneNumber: pn, instanceId: this.instanceId });
+    }
+    if (contacts.length) {
+      this.sendDataWebhook(Events.CONTACTS_UPSERT, contacts);
+    }
+  }
+
+  /**
+   * Baileys hands over the mappings it learns from a history sync as `lidPnMappings`
+   * on messaging-history.set, but history is processed inside a buffered function and
+   * the event buffer drops that field when it consolidates the batch (Baileys
+   * lib/Utils/event-buffer.js, consolidateEvents). So read it where Baileys emits it,
+   * before the buffer does. Every mapping in the batch is there, whether it came from
+   * phoneNumberToLidMappings or from a conversation's pnJid or lidJid, and nothing is
+   * looked up, so no network query can follow.
+   */
+  private tapHistoryLidMappings() {
+    const ev = this.client.ev as any;
+    if (ev.__lidPnMappingsTap) return;
+    const emit = ev.emit.bind(ev);
+    ev.emit = (event: string, data: any) => {
+      if (event === 'messaging-history.set' && data?.lidPnMappings?.length) {
+        const mappings = [...data.lidPnMappings];
+        this.eventProcessingQueue = this.eventProcessingQueue.then(() => {
+          try {
+            if (!this.endSession) this.lidMappingHandle(mappings);
+          } catch (error) {
+            this.logger.error(error);
+          }
+        });
+      }
+      return emit(event, data);
+    };
+    ev.__lidPnMappingsTap = true;
+  }
 
   private readonly messageHandle = {
     'messaging-history.set': async ({
@@ -1879,6 +1930,8 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
+    this.tapHistoryLidMappings();
+
     this.client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
@@ -1911,6 +1964,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['creds.update']) {
               this.instance.authState.saveCreds();
+            }
+
+            if (events['lid-mapping.update']) {
+              this.lidMappingHandle([events['lid-mapping.update']]);
             }
 
             if (events['messaging-history.set']) {

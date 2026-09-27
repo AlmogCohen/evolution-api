@@ -17,7 +17,8 @@ vi.mock('@api/server.module', () => import('../helpers/fake-server-module'));
 
 import { readFile, rm } from 'node:fs/promises';
 
-import { encryptedStream, encryptMediaRetryRequest, getBinaryNodeChild } from 'baileys';
+import { Boom } from '@hapi/boom';
+import { encryptedStream, encryptMediaRetryRequest, getBinaryNodeChild, proto } from 'baileys';
 import { getGlobalDispatcher, MockAgent, setGlobalDispatcher } from 'undici';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
@@ -82,7 +83,12 @@ async function downloadWithKey(service: any, key: Record<string, any>) {
     message: {
       key,
       message: {
-        imageMessage: { url: `http://127.0.0.1:${cdn.port}${GONE}`, mediaKey, mimetype: 'image/jpeg', fileLength: PLAIN.length },
+        imageMessage: {
+          url: `http://127.0.0.1:${cdn.port}${GONE}`,
+          mediaKey,
+          mimetype: 'image/jpeg',
+          fileLength: PLAIN.length,
+        },
       },
     },
   });
@@ -94,7 +100,13 @@ describe('a media re-upload names the chat by the address WhatsApp stores it und
   it('a DM key from the webhook (phone, @lid in remoteJidAlt) asks under the @lid', async () => {
     const { service, keys, rmr } = await serviceWithPhone();
 
-    await downloadWithKey(service, { remoteJid: PHONE, remoteJidAlt: LID, fromMe: false, id: ID, addressingMode: 'pn' });
+    await downloadWithKey(service, {
+      remoteJid: PHONE,
+      remoteJidAlt: LID,
+      fromMe: false,
+      id: ID,
+      addressingMode: 'pn',
+    });
 
     expect(keys).toEqual([{ remoteJid: LID, remoteJidAlt: PHONE, fromMe: false, id: ID, addressingMode: 'lid' }]);
     expect(rmr).toEqual([{ jid: LID, from_me: 'false', participant: undefined }]);
@@ -103,7 +115,13 @@ describe('a media re-upload names the chat by the address WhatsApp stores it und
   it("a DM key stored from Evolution 2.3.7 (the phone twice, addressingMode 'lid') asks under the @lid Baileys maps it to", async () => {
     const { service, keys, rmr } = await serviceWithPhone({ [PHONE]: LID });
 
-    await downloadWithKey(service, { remoteJid: PHONE, remoteJidAlt: PHONE, fromMe: false, id: ID, addressingMode: 'lid' });
+    await downloadWithKey(service, {
+      remoteJid: PHONE,
+      remoteJidAlt: PHONE,
+      fromMe: false,
+      id: ID,
+      addressingMode: 'lid',
+    });
 
     expect(keys).toEqual([{ remoteJid: LID, remoteJidAlt: PHONE, fromMe: false, id: ID, addressingMode: 'lid' }]);
     expect(rmr).toEqual([{ jid: LID, from_me: 'false', participant: undefined }]);
@@ -112,9 +130,18 @@ describe('a media re-upload names the chat by the address WhatsApp stores it und
   it('a group key with the phone as participant and the @lid in participantAlt asks under the @lid participant', async () => {
     const { service, keys, rmr } = await serviceWithPhone();
 
-    await downloadWithKey(service, { remoteJid: GROUP, fromMe: false, id: ID, participant: PHONE, participantAlt: LID, addressingMode: 'pn' });
+    await downloadWithKey(service, {
+      remoteJid: GROUP,
+      fromMe: false,
+      id: ID,
+      participant: PHONE,
+      participantAlt: LID,
+      addressingMode: 'pn',
+    });
 
-    expect(keys).toEqual([{ remoteJid: GROUP, fromMe: false, id: ID, participant: LID, participantAlt: PHONE, addressingMode: 'lid' }]);
+    expect(keys).toEqual([
+      { remoteJid: GROUP, fromMe: false, id: ID, participant: LID, participantAlt: PHONE, addressingMode: 'lid' },
+    ]);
     expect(rmr).toEqual([{ jid: GROUP, from_me: 'false', participant: LID }]);
   });
 
@@ -130,7 +157,14 @@ describe('a media re-upload names the chat by the address WhatsApp stores it und
 
   it('control: a group key from the webhook (the @lid participant, as Baileys gave it) is asked for as it is', async () => {
     const { service, keys, rmr } = await serviceWithPhone();
-    const key = { remoteJid: GROUP, fromMe: false, id: ID, participant: LID, participantAlt: PHONE, addressingMode: 'lid' };
+    const key = {
+      remoteJid: GROUP,
+      fromMe: false,
+      id: ID,
+      participant: LID,
+      participantAlt: PHONE,
+      addressingMode: 'lid',
+    };
 
     await downloadWithKey(service, key);
 
@@ -146,5 +180,35 @@ describe('a media re-upload names the chat by the address WhatsApp stores it und
 
     expect(keys).toEqual([key]);
     expect(rmr).toEqual([{ jid: PHONE, from_me: 'false', participant: undefined }]);
+  });
+
+  // A DM WhatsApp addresses by phone also carries the @lid, in remoteJidAlt (Baileys'
+  // extractAddressingContext: sender_lid), with addressingMode 'pn'. That is exactly the key the
+  // webhook shows for an @lid-addressed DM after its swap, so the key alone cannot say which address
+  // the phone keeps the message under. Asked only under the @lid, the phone refuses a message it
+  // keeps under the phone JID.
+  it('a DM WhatsApp addresses by phone, whose key also carries its @lid, is still re-uploaded', async () => {
+    const { service, keys } = await serviceWithPhone();
+    const upload = service.client.updateMediaMessage;
+    service.client.updateMediaMessage = async (message: any) => {
+      if (message.key.remoteJid !== PHONE) {
+        keys.push({ ...message.key });
+        throw new Boom('Media re-upload failed by device', {
+          statusCode: 404,
+          data: { result: proto.MediaRetryNotification.ResultType.NOT_FOUND },
+        });
+      }
+      return upload(message);
+    };
+
+    await downloadWithKey(service, {
+      remoteJid: PHONE,
+      remoteJidAlt: LID,
+      fromMe: false,
+      id: ID,
+      addressingMode: 'pn',
+    });
+
+    expect(keys.map((k) => k.remoteJid)).toEqual([LID, PHONE]);
   });
 });

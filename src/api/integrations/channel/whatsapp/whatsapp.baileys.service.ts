@@ -266,7 +266,7 @@ export class BaileysStartupService extends ChannelStartupService {
   // burst. WhatsApp's picture notification (contacts.update imgUrl) refreshes it.
   private readonly PICTURE_TTL_MS = 60 * 60 * 1000;
   private readonly pictureCache = new Map<string, { url: string | null; at: number }>();
-  private readonly pictureLookups = new Map<string, Promise<string | null>>();
+  private readonly pictureLookups = new Map<string, { bulk: boolean; lookup: Promise<string | null> }>();
   // Lookups the event handlers start on their own (pictures, group metadata refreshes): four at a time.
   private readonly backgroundQueries = new QueryLimiter(4);
   private readonly groupRefreshes = new Map<string, Promise<GroupMetadata | null>>();
@@ -923,51 +923,8 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        const updatedContacts = await Promise.all(
-          contacts.map(async (contact) => ({
-            remoteJid: contact.id,
-            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
-            profilePicUrl: (await this.cachedProfilePicture(contact.id)).profilePictureUrl,
-            instanceId: this.instanceId,
-          })),
-        );
-
-        if (updatedContacts.length > 0) {
-          const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
-          if (usersContacts) {
-            await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
-          }
-
-          this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
-          await Promise.all(
-            updatedContacts.map(async (contact) => {
-              if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-                await this.prismaRepository.contact.updateMany({
-                  where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
-                  data: { profilePicUrl: contact.profilePicUrl },
-                });
-              }
-
-              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-                const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
-
-                const findParticipant = await this.chatwootService.findContact(
-                  instance,
-                  contact.remoteJid.split('@')[0],
-                );
-
-                if (!findParticipant) {
-                  return;
-                }
-
-                this.chatwootService.updateContact(instance, findParticipant.id, {
-                  name: contact.pushName,
-                  avatar_url: contact.profilePicUrl,
-                });
-              }
-            }),
-          );
-        }
+        // Pictures follow on contacts.update when their lookups finish: history waits for none of them.
+        void this.contactPictures(contacts);
       } catch (error) {
         console.error(error);
         this.logger.error(`Error: ${error.message}`);
@@ -2196,6 +2153,56 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
+  /** Look up the pictures of contacts from contacts.upsert (history, address book) and send them on contacts.update. */
+  private async contactPictures(contacts: Contact[]) {
+    try {
+      const updatedContacts = await Promise.all(
+        contacts.map(async (contact) => ({
+          remoteJid: contact.id,
+          pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+          profilePicUrl: (await this.cachedProfilePicture(contact.id, { bulk: true })).profilePictureUrl,
+          instanceId: this.instanceId,
+        })),
+      );
+
+      if (updatedContacts.length > 0) {
+        const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
+        if (usersContacts) {
+          await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
+        }
+
+        this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
+        await Promise.all(
+          updatedContacts.map(async (contact) => {
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+              await this.prismaRepository.contact.updateMany({
+                where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
+                data: { profilePicUrl: contact.profilePicUrl },
+              });
+            }
+
+            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+              const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
+
+              const findParticipant = await this.chatwootService.findContact(instance, contact.remoteJid.split('@')[0]);
+
+              if (!findParticipant) {
+                return;
+              }
+
+              this.chatwootService.updateContact(instance, findParticipant.id, {
+                name: contact.pushName,
+                avatar_url: contact.profilePicUrl,
+              });
+            }
+          }),
+        );
+      }
+    } catch (error) {
+      this.logger.error(`Error: ${error.message}`);
+    }
+  }
+
   /** Asks WhatsApp now (an explicit request), and keeps the answer for the event handlers. */
   public async profilePicture(number: string) {
     const jid = createJid(number);
@@ -2211,26 +2218,36 @@ export class BaileysStartupService extends ChannelStartupService {
     return { wuid: jid, profilePictureUrl };
   }
 
-  /** The picture the event handlers report: kept for PICTURE_TTL_MS, one lookup per jid at a time. */
-  private async cachedProfilePicture(number: string, opts: { fresh?: boolean } = {}) {
+  /**
+   * The picture the event handlers report: kept for PICTURE_TTL_MS, one lookup per jid at a time.
+   * Bulk lookups (history, address book) queue behind each other; a live event's lookup never joins one.
+   */
+  private async cachedProfilePicture(number: string, opts: { fresh?: boolean; bulk?: boolean } = {}) {
     const jid = createJid(number);
-    const kept = this.pictureCache.get(jid);
+    const bulk = !!opts.bulk;
+    const kept = () => {
+      const k = this.pictureCache.get(jid);
+      return !opts.fresh && k && Date.now() - k.at < this.PICTURE_TTL_MS ? k : undefined;
+    };
 
-    if (!opts.fresh && kept && Date.now() - kept.at < this.PICTURE_TTL_MS) {
-      return { wuid: jid, profilePictureUrl: kept.url };
-    }
+    if (kept()) return { wuid: jid, profilePictureUrl: kept().url };
 
-    let lookup = opts.fresh ? undefined : this.pictureLookups.get(jid);
-    if (!lookup) {
-      const started = this.backgroundQueries
-        .run(() => this.profilePicture(jid))
-        .then((r) => r.profilePictureUrl)
-        .finally(() => {
-          if (this.pictureLookups.get(jid) === started) this.pictureLookups.delete(jid);
-        });
-      this.pictureLookups.set(jid, started);
-      lookup = started;
-    }
+    const pending = opts.fresh ? undefined : this.pictureLookups.get(jid);
+    if (pending && (bulk || !pending.bulk)) return { wuid: jid, profilePictureUrl: await pending.lookup };
+
+    const lookup = this.backgroundQueries
+      // A queued lookup may find the picture already kept by the time its turn comes.
+      .run(
+        async () => {
+          const k = kept();
+          return k ? k.url : (await this.profilePicture(jid)).profilePictureUrl;
+        },
+        { bulk },
+      )
+      .finally(() => {
+        if (this.pictureLookups.get(jid)?.lookup === lookup) this.pictureLookups.delete(jid);
+      });
+    this.pictureLookups.set(jid, { bulk, lookup });
 
     return { wuid: jid, profilePictureUrl: await lookup };
   }

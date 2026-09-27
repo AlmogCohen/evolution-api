@@ -64,7 +64,8 @@ describe('live-check scrubber', () => {
     const text = readdirSync(dir)
       .map((f) => readFileSync(join(dir, f), 'utf8'))
       .join('\n');
-    for (const original of ORIGINALS) expect(text.includes(original), `an original of ${original.length} chars`).toBe(false);
+    for (const original of ORIGINALS)
+      expect(text.includes(original), `an original of ${original.length} chars`).toBe(false);
   });
 
   it('gives one person one fake across phone JID, @lid and device suffix, in both tapes', () => {
@@ -128,7 +129,12 @@ describe('live-check scrubber', () => {
 
   it('adds what the operator records, and a report of counts only', () => {
     const { dir } = scrub({
-      operator: { phoneModel: 'Pixel 8', osVersion: 'Android 15', whatsappAppVersion: '2.25.27.78', countryCode: '972' },
+      operator: {
+        phoneModel: 'Pixel 8',
+        osVersion: 'Android 15',
+        whatsappAppVersion: '2.25.27.78',
+        countryCode: '972',
+      },
     });
     const manifest = JSON.parse(readFileSync(join(dir, 'manifest.json'), 'utf8'));
     expect(manifest).toMatchObject({
@@ -158,7 +164,10 @@ describe('live-check scrubber', () => {
       socket: 1,
       event: 'messages.upsert',
       buffered: false,
-      data: { type: 'append', messages: [{ key: { remoteJid: '120363401234567890@g.us', fromMe: false, id }, messageStubType: 20 }] },
+      data: {
+        type: 'append',
+        messages: [{ key: { remoteJid: '120363401234567890@g.us', fromMe: false, id }, messageStubType: 20 }],
+      },
     };
     appendFileSync(join(raw, 'events.ndjson'), JSON.stringify(stub) + '\n');
     const { dir, report } = scrub();
@@ -192,5 +201,82 @@ describe('live-check scrubber', () => {
     expect(message).toContain('events.ndjson');
     for (const original of ORIGINALS) expect(message.includes(original)).toBe(false);
     expect(existsSync(out)).toBe(false);
+  });
+
+  // A string was kept as written whenever it looked like an identifier, whatever its field, and a
+  // decimal number always was: a username, a group name in a stub parameter, a value in a field the
+  // scrubber had never seen, a location. The leak gate searched only for what the scrubber replaced.
+  describe('what it cannot tell from structure', () => {
+    const plant = (data: any) =>
+      appendFileSync(
+        join(raw, 'events.ndjson'),
+        JSON.stringify({ seq: 999, t: 1, socket: 1, event: 'messages.upsert', buffered: false, data }) + '\n',
+      );
+    const fixtureText = (dir: string) =>
+      readdirSync(dir)
+        .map((f) => readFileSync(join(dir, f), 'utf8'))
+        .join('\n');
+
+    it('replaces a username, wherever the same value appears', () => {
+      const username = 'dana.levi88';
+      plant({
+        type: 'notify',
+        messages: [
+          {
+            key: { remoteJid: PERSON.lid, remoteJidUsername: username, fromMe: false, id: MESSAGE_ID },
+            message: { conversation: `my handle is ${username}` },
+          },
+        ],
+      });
+      const { dir } = scrub();
+      expect(fixtureText(dir).includes(username)).toBe(false);
+    });
+
+    it('replaces the text of a stub parameter', () => {
+      const groupName = 'dana_and_friends';
+      plant({
+        type: 'append',
+        messages: [
+          {
+            key: { remoteJid: '120363401234567890@g.us', fromMe: false, id: '8347261905' },
+            messageStubType: 21,
+            messageStubParameters: [groupName],
+          },
+        ],
+      });
+      const { dir } = scrub();
+      expect(fixtureText(dir).includes(groupName)).toBe(false);
+    });
+
+    it('replaces a location', () => {
+      plant({
+        type: 'notify',
+        messages: [
+          {
+            key: { remoteJid: PERSON.lid, fromMe: false, id: MESSAGE_ID },
+            message: { locationMessage: { degreesLatitude: 32.0853, degreesLongitude: 34.7818 } },
+          },
+        ],
+      });
+      const { dir } = scrub();
+      const text = fixtureText(dir);
+      expect({ latitude: text.includes('32.0853'), longitude: text.includes('34.7818') }).toEqual({
+        latitude: false,
+        longitude: false,
+      });
+    });
+
+    it('stops on a field it does not know, names its path, and writes nothing', () => {
+      plant({ type: 'notify', messages: [], someFutureField: 'dana.levi' });
+      let message = '';
+      try {
+        scrub();
+      } catch (error) {
+        message = String(error?.message);
+      }
+      expect(message).toMatch(/unknown field .*someFutureField/);
+      expect(message.includes('dana.levi')).toBe(false);
+      expect(existsSync(out)).toBe(false);
+    });
   });
 });

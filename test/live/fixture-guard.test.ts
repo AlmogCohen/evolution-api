@@ -162,4 +162,37 @@ describe('live fixture guard', () => {
     const findings = scanFixtures(join(process.cwd(), 'test', 'fixtures', 'live'));
     expect(formatFindings(findings)).toBe('');
   });
+
+  // The guard knew the fake ranges of addresses and numbers only: a username, a group name in a stub
+  // parameter, a value under a field it did not know, or a location passed as clean.
+  it('flags a value that is neither a scrubber fake nor a known structural value, and never prints it', () => {
+    const dir = join(root, 'live', '2026-09-27-unknown');
+    mkdirSync(dir, { recursive: true });
+    const values = { username: 'dana.levi88', group: 'dana_and_friends', unknown: 'dana.levi' };
+    const key = { remoteJid: '100000000000001@lid', fromMe: false, id: '3AFFFFFFFFFFFFFFFFF1' };
+    const lines = [
+      {
+        seq: 1,
+        event: 'messages.upsert',
+        data: { messages: [{ key: { ...key, remoteJidUsername: values.username } }] },
+      },
+      { seq: 2, event: 'messages.upsert', data: { messages: [{ key, messageStubParameters: [values.group] }] } },
+      { seq: 3, event: 'messages.upsert', data: { type: 'notify', someFutureField: values.unknown } },
+      {
+        seq: 4,
+        event: 'messages.upsert',
+        data: {
+          messages: [{ key, message: { locationMessage: { degreesLatitude: 32.0853, degreesLongitude: 34.7818 } } }],
+        },
+      },
+    ];
+    writeFileSync(join(dir, 'events.ndjson'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+
+    const findings = scanFixtures(join(root, 'live'));
+    expect([...new Set(findings.map((f) => f.line))].sort()).toEqual([1, 2, 3, 4]);
+    const report = formatFindings(findings);
+    for (const value of [...Object.values(values), '32.0853', '34.7818']) {
+      expect(report.includes(value), `the report printed a planted value of ${value.length} chars`).toBe(false);
+    }
+  });
 });

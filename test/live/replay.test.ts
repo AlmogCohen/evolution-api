@@ -82,12 +82,12 @@ describe('live-check replay', () => {
   it('delivers the batches the tape recorded, a non-bufferable event inside a buffer included', async () => {
     const dir = join(root, 'interleaved');
     mkdirSync(dir);
-    const contact = (name: string) => [{ id: '972500000001@s.whatsapp.net', notify: name }];
+    const contact = (i: number) => [{ id: `97250000000${i}@s.whatsapp.net`, notify: `Name ${i}` }];
     const lines = [
-      { seq: 1, t: 1, socket: 1, event: 'contacts.upsert', buffered: true, data: contact('Name 1') },
+      { seq: 1, t: 1, socket: 1, event: 'contacts.upsert', buffered: true, data: contact(1) },
       { seq: 2, t: 2, socket: 1, event: 'connection.update', buffered: true, data: { isOnline: true } },
       { seq: 3, t: 3, socket: 1, batch: ['connection.update'] },
-      { seq: 4, t: 4, socket: 1, event: 'contacts.update', buffered: true, data: contact('Name 2') },
+      { seq: 4, t: 4, socket: 1, event: 'contacts.update', buffered: true, data: contact(2) },
       { seq: 5, t: 5, socket: 1, batch: ['contacts.upsert', 'contacts.update'] },
     ];
     writeFileSync(join(dir, 'events.ndjson'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');

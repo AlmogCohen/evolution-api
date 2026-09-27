@@ -33,6 +33,22 @@ export function loadFixture(dir: string) {
   };
 }
 
+/** The events Baileys' buffer holds (BUFFERABLE_EVENT in Baileys lib/Utils/event-buffer.js, rc14). */
+const BUFFERABLE = new Set([
+  'messaging-history.set',
+  'chats.upsert',
+  'chats.update',
+  'chats.delete',
+  'contacts.upsert',
+  'contacts.update',
+  'messages.upsert',
+  'messages.update',
+  'messages.delete',
+  'messages.reaction',
+  'message-receipt.update',
+  'groups.update',
+]);
+
 export async function replayFixture(dir: string, opts: { profile?: Profile; client?: Record<string, any> } = {}) {
   const { events, manifest } = loadFixture(dir);
   const { service, ev, prisma } = await makeService({ profile: opts.profile });
@@ -58,7 +74,10 @@ export async function replayFixture(dir: string, opts: { profile?: Profile; clie
     if (line.socket < socket) continue;
     socket = line.socket;
     if (line.batch) {
-      await flush();
+      // Only a batch with a bufferable event is the buffer's flush; one of non-bufferable events
+      // only (a connection.update inside a buffer) was delivered at once, with the buffer still held.
+      if (line.batch.some((event: string) => BUFFERABLE.has(event))) await flush();
+      else await service.eventProcessingQueue;
       continue;
     }
     if (line.origin === 'app') continue;
@@ -72,7 +91,15 @@ export async function replayFixture(dir: string, opts: { profile?: Profile; clie
 }
 
 /** Fields Evolution fills from the clock, the database or a socket query: not part of the comparison. */
-export const VOLATILE = ['dateTime', 'date_time', 'createdAt', 'updatedAt', 'instanceId', 'profilePicUrl', 'profilePictureUrl'];
+export const VOLATILE = [
+  'dateTime',
+  'date_time',
+  'createdAt',
+  'updatedAt',
+  'instanceId',
+  'profilePicUrl',
+  'profilePictureUrl',
+];
 
 function normalize(value: any, volatile: Set<string>): any {
   if (Array.isArray(value)) return value.map((v) => normalize(v, volatile));

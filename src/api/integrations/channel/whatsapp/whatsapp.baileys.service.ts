@@ -454,7 +454,7 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       await this.connect(this.phoneNumber);
     } catch (error) {
-      this.logger.error({ message: 'Connect for a pending logout failed', error: error?.toString() });
+      this.logger.error({ message: 'Connect for a pending logout failed', error: errorFields(error?.cause ?? error) });
       this.scheduleReconnect();
     }
     return true;

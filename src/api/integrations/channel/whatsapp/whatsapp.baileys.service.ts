@@ -1116,15 +1116,20 @@ export class BaileysStartupService extends ChannelStartupService {
       let proxy: Parameters<typeof makeProxyAgent>[0];
 
       if (this.localProxy?.host?.includes('proxyscrape')) {
+        // No list, no exit: the connect fails (and is retried) rather than leave from the server's address.
+        let proxyUrls: string[];
         try {
           const response = await axios.get(this.localProxy?.host);
-          const text = response.data;
-          const proxyUrls = text.split('\r\n');
-          const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
-          proxy = 'http://' + proxyUrls[rand];
-        } catch {
-          this.localProxy.enabled = false;
+          proxyUrls = String(response.data ?? '')
+            .split('\r\n')
+            .filter((line) => line.trim());
+        } catch (error) {
+          throw new Error(
+            `The proxy list could not be fetched (${errorName(error)}): not connecting without the proxy`,
+          );
         }
+        if (!proxyUrls.length) throw new Error('The proxy list is empty: not connecting without the proxy');
+        proxy = 'http://' + proxyUrls[Math.floor(Math.random() * proxyUrls.length)];
       } else {
         proxy = {
           host: this.localProxy.host,
@@ -4712,8 +4717,12 @@ export class BaileysStartupService extends ChannelStartupService {
     if (!this.localProxy?.enabled || !this.localProxy.host) return {};
     const key = this.proxyKey();
     if (this.mediaProxy?.key !== key) {
-      // A proxyscrape host is a list the socket picked one exit from; only the socket's own dispatcher is that exit.
-      if (this.localProxy.host.includes('proxyscrape')) return {};
+      // A proxyscrape host is a list the socket picked one exit from; only the socket's own dispatcher
+      // is that exit. Without one, the download fails rather than leave from the server's address.
+      if (this.localProxy.host.includes('proxyscrape')) {
+        if (this.mediaProxy) return { options: { dispatcher: this.mediaProxy.dispatcher } as RequestInit };
+        throw new BadRequestException('No proxy exit for this download yet: connect the instance first');
+      }
       this.mediaProxy = {
         key,
         dispatcher: makeProxyAgentUndici({

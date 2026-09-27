@@ -362,17 +362,22 @@ export class ChannelStartupService {
     }
   }
 
+  /**
+   * Read the instance's proxy (the global PROXY_* configuration, then its Proxy row) and put it in
+   * force at once. The one in force stays until the new one is read: a media download while this
+   * waits for the database must not leave directly, and a failed read (thrown) changes nothing.
+   */
   public async loadProxy() {
-    this.localProxy.enabled = false;
+    const next: Partial<wa.LocalProxy> = { enabled: false };
 
     const proxyConfig = this.configService.get<Proxy>('PROXY');
     if (proxyConfig.HOST) {
-      this.localProxy.enabled = true;
-      this.localProxy.host = proxyConfig.HOST;
-      this.localProxy.port = proxyConfig.PORT || '80';
-      this.localProxy.protocol = proxyConfig.PROTOCOL || 'http';
-      this.localProxy.username = proxyConfig.USERNAME;
-      this.localProxy.password = proxyConfig.PASSWORD;
+      next.enabled = true;
+      next.host = proxyConfig.HOST;
+      next.port = proxyConfig.PORT || '80';
+      next.protocol = proxyConfig.PROTOCOL || 'http';
+      next.username = proxyConfig.USERNAME;
+      next.password = proxyConfig.PASSWORD;
     }
 
     const data = await this.prismaRepository.proxy.findUnique({
@@ -382,13 +387,15 @@ export class ChannelStartupService {
     });
 
     if (data?.enabled) {
-      this.localProxy.enabled = true;
-      this.localProxy.host = data?.host;
-      this.localProxy.port = data?.port;
-      this.localProxy.protocol = data?.protocol;
-      this.localProxy.username = data?.username;
-      this.localProxy.password = data?.password;
+      next.enabled = true;
+      next.host = data?.host;
+      next.port = data?.port;
+      next.protocol = data?.protocol;
+      next.username = data?.username;
+      next.password = data?.password;
     }
+
+    Object.assign(this.localProxy, next);
   }
 
   public async setProxy(data: ProxyDto) {

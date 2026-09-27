@@ -15,7 +15,7 @@ vi.mock('@utils/fetchLatestWaWebVersion', () => ({
   fetchLatestWaWebVersion: async () => ({ version: [2, 3000, 1], isLatest: true }),
 }));
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -257,5 +257,24 @@ describe('live-check recorder', () => {
         code: false,
       });
     });
+  });
+
+  // The recorder is prepared right after the socket is built and before Evolution listens to it.
+  // Creating its directory and first manifest was outside its guard, so a LIVE_RECORD_DIR that
+  // cannot be written (no permission, a full volume, a file in the way) failed the connect with a
+  // socket already built and nobody listening to it.
+  it('a recording directory that cannot be created costs the recording only, never the connection', async () => {
+    const blocked = join(root, 'not-a-directory');
+    writeFileSync(blocked, 'a file where the directory should go');
+    process.env.LIVE_RECORD_DIR = join(blocked, 'records');
+    socketSpy.mockClear();
+    const { service } = await makeService();
+    stubAuthState(service);
+    const outcome = await service.connectToWhatsapp().then(
+      () => 'connected',
+      (e: any) => `failed: ${e?.message}`,
+    );
+    const sock = socketSpy.mock.results[0]?.value;
+    expect({ outcome, listened: sock?.handlers?.() > 0 }).toEqual({ outcome: 'connected', listened: true });
   });
 });

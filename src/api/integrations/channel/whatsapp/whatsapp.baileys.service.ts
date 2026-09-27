@@ -85,6 +85,7 @@ import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { jidKind, makeBaileysLogger } from '@utils/log-privacy';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
+import { QueryLimiter } from '@utils/queryLimiter';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
@@ -264,11 +265,11 @@ export class BaileysStartupService extends ChannelStartupService {
   // used to ask WhatsApp again, which at link time is thousands of IQs in a
   // burst. WhatsApp's picture notification (contacts.update imgUrl) refreshes it.
   private readonly PICTURE_TTL_MS = 60 * 60 * 1000;
-  private readonly PICTURE_MAX_IN_FLIGHT = 4;
   private readonly pictureCache = new Map<string, { url: string | null; at: number }>();
   private readonly pictureLookups = new Map<string, Promise<string | null>>();
-  private pictureSlots = 0;
-  private readonly pictureWaiters: (() => void)[] = [];
+  // Lookups the event handlers start on their own (pictures, group metadata refreshes): four at a time.
+  private readonly backgroundQueries = new QueryLimiter(4);
+  private readonly groupRefreshes = new Map<string, Promise<GroupMetadata | null>>();
 
   public stateConnection: wa.StateConnection = { state: 'close' };
 
@@ -1876,8 +1877,13 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.GROUPS_UPDATE, groupMetadataUpdate);
 
       groupMetadataUpdate.forEach((group) => {
-        if (isJidGroup(group.id)) {
-          this.updateGroupMetadataCache(group.id);
+        if (!isJidGroup(group.id)) return;
+        // A listing (groupFetchAllParticipating) carries each group's full metadata: keep it as it is.
+        // A change (subject, settings) carries only what changed: ask for the group once.
+        if (Array.isArray(group.participants)) {
+          this.keepGroupMetadata(group.id, group as GroupMetadata);
+        } else {
+          this.refreshGroupMetadata(group.id);
         }
       });
     },
@@ -1943,7 +1949,7 @@ export class BaileysStartupService extends ChannelStartupService {
         this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, participantsUpdate);
       }
 
-      this.updateGroupMetadataCache(participantsUpdate.id);
+      this.refreshGroupMetadata(participantsUpdate.id);
     },
   };
 
@@ -2216,7 +2222,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
     let lookup = opts.fresh ? undefined : this.pictureLookups.get(jid);
     if (!lookup) {
-      const started = this.withPictureSlot(() => this.profilePicture(jid))
+      const started = this.backgroundQueries
+        .run(() => this.profilePicture(jid))
         .then((r) => r.profilePictureUrl)
         .finally(() => {
           if (this.pictureLookups.get(jid) === started) this.pictureLookups.delete(jid);
@@ -2226,19 +2233,6 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return { wuid: jid, profilePictureUrl: await lookup };
-  }
-
-  private async withPictureSlot<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.pictureSlots >= this.PICTURE_MAX_IN_FLIGHT) {
-      await new Promise<void>((resolve) => this.pictureWaiters.push(resolve));
-    }
-    this.pictureSlots++;
-    try {
-      return await fn();
-    } finally {
-      this.pictureSlots--;
-      this.pictureWaiters.shift()?.();
-    }
   }
 
   public async getStatus(number: string) {
@@ -4502,16 +4496,32 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   // Group
+  private async keepGroupMetadata(groupJid: string, meta: GroupMetadata) {
+    const cacheConf = this.configService.get<CacheConf>('CACHE');
+
+    if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
+      this.logger.verbose(`Updating cache for group: ${groupJid}`);
+      await groupMetadataCache.set(groupJid, { timestamp: Date.now(), data: meta });
+    }
+  }
+
+  /** Refetch a group's metadata in the background: one query per group at a time, a few groups at once. */
+  private refreshGroupMetadata(groupJid: string) {
+    let refresh = this.groupRefreshes.get(groupJid);
+    if (!refresh) {
+      refresh = this.backgroundQueries
+        .run(() => this.updateGroupMetadataCache(groupJid))
+        .finally(() => this.groupRefreshes.delete(groupJid));
+      this.groupRefreshes.set(groupJid, refresh);
+    }
+    return refresh;
+  }
+
   private async updateGroupMetadataCache(groupJid: string) {
     try {
       const meta = await this.client.groupMetadata(groupJid);
 
-      const cacheConf = this.configService.get<CacheConf>('CACHE');
-
-      if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
-        this.logger.verbose(`Updating cache for group: ${groupJid}`);
-        await groupMetadataCache.set(groupJid, { timestamp: Date.now(), data: meta });
-      }
+      await this.keepGroupMetadata(groupJid, meta);
 
       return meta;
     } catch (error) {

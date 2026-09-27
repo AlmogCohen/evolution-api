@@ -107,14 +107,23 @@ export class LiveRecorder {
     this.writeManifest();
   }
 
-  /** A recorder for this instance's session, or undefined when LIVE_RECORD_DIR is not set. */
+  /**
+   * A recorder for this instance's session, or undefined when LIVE_RECORD_DIR is not set, or when
+   * its directory or first manifest cannot be written: a recording that cannot start costs the
+   * recording, never the connection it was to watch.
+   */
   static start(instanceName: string, env: NodeJS.ProcessEnv = process.env): LiveRecorder | undefined {
     const root = env.LIVE_RECORD_DIR;
     if (!root) return undefined;
-    const stamp = new Date().toISOString().replace(/:/g, '-');
-    const dir = join(root, safeName(instanceName), stamp);
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    return new LiveRecorder(dir);
+    try {
+      const stamp = new Date().toISOString().replace(/:/g, '-');
+      const dir = join(root, safeName(instanceName), stamp);
+      mkdirSync(dir, { recursive: true, mode: 0o700 });
+      return new LiveRecorder(dir);
+    } catch (error) {
+      console.warn(`[live-record] recording not started: ${error?.code ?? error?.name ?? 'error'}`);
+      return undefined;
+    }
   }
 
   /** Record every event this socket emits, and every batch its buffer delivers. Call before eventHandler(). */
@@ -125,7 +134,7 @@ export class LiveRecorder {
     // The method that linked the account is the one asked for before the first open.
     if (!this.manifest.openedAt) this.manifest.linkMethod = facts.linkMethod;
     this.manifest.proxy = { used: !!facts.proxyProtocol, protocol: facts.proxyProtocol };
-    this.writeManifest();
+    this.guard(() => this.writeManifest());
 
     const ev = client.ev;
     const emit = ev.emit.bind(ev);

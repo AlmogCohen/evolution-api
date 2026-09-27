@@ -15,7 +15,7 @@ vi.mock('@utils/fetchLatestWaWebVersion', () => ({
   fetchLatestWaWebVersion: async () => ({ version: [2, 3000, 1], isLatest: true }),
 }));
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -276,5 +276,25 @@ describe('live-check recorder', () => {
     );
     const sock = socketSpy.mock.results[0]?.value;
     expect({ outcome, listened: sock?.handlers?.() > 0 }).toEqual({ outcome: 'connected', listened: true });
+  });
+
+  it('a manifest that can no longer be written when a socket is attached stops the recording, not the socket', async () => {
+    process.env.LIVE_RECORD_DIR = root;
+    const { LiveRecorder } = await import('@utils/live-record/recorder');
+    const recorder = LiveRecorder.start('test');
+    const manifest = join(recorder.dir, 'manifest.json');
+    chmodSync(manifest, 0o400);
+    try {
+      expect(() =>
+        recorder.attach(fakeSocket(), {
+          waWebVersion: '2.3000.1',
+          linkMethod: 'qr',
+          proxyProtocol: null,
+          creds: () => ({}),
+        }),
+      ).not.toThrow();
+    } finally {
+      chmodSync(manifest, 0o600);
+    }
   });
 });

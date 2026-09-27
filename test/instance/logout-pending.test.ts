@@ -624,3 +624,24 @@ describe('a logout that cannot reach WhatsApp', () => {
     expect({ me: storedMe(), pending: service.logoutPending }).toEqual({ me: [], pending: false });
   });
 });
+
+// On boot the monitor lists the instances and connects each one that was open, then registers it.
+// A connect that failed there (the database answering the listing but failing the next read)
+// left the instance unregistered, with no socket and no reconnect: out of the API until the
+// process restarted, although the database came back a second later.
+describe('a boot whose first connect fails on a database read', () => {
+  it('keeps the instance in the API and connects it once the database answers', async () => {
+    await linkedInstance();
+    const read = prisma.setting.findUnique;
+    let failures = 1;
+    prisma.setting.findUnique = async (args: any) => {
+      if (failures-- > 0) throw new Error("Can't reach database server");
+      return read(args);
+    };
+
+    const monitor = await startProcess();
+    await vi.waitFor(() => expect(monitor.waInstances.test).toBeDefined(), { timeout: 1_000 });
+    await vi.waitFor(() => expect(built()).toHaveLength(1), { timeout: 3_000 });
+    prisma.setting.findUnique = read;
+  });
+});

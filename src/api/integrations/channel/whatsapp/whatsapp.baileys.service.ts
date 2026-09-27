@@ -237,6 +237,22 @@ type MediaReupload = 'not_requested' | 'ok' | 'failed';
 /** The HTTP status a Baileys media error carries (a Boom's output.statusCode), or 'none'. */
 const httpStatus = (error: any) => error?.output?.statusCode ?? error?.status ?? 'none';
 
+/**
+ * Why the phone refused a re-upload, from the error Baileys' updateMediaMessage threw:
+ * the phone's MediaRetryNotification result (NOT_FOUND, DECRYPTION_ERROR, GENERAL_ERROR),
+ * error_<code> for an <error> answer, missing_ciphertext for an answer with neither,
+ * no_answer when it did not answer in time, else unknown. Never content or a JID.
+ */
+const reuploadRefusal = (error: any): string => {
+  if (error?.name === 'ReuploadTimeoutError') return 'no_answer';
+  const result = error?.data?.result;
+  if (typeof result === 'number') return proto.MediaRetryNotification.ResultType[result] ?? `result_${result}`;
+  const code = String(error?.data?.code ?? '');
+  if (/^\d{1,6}$/.test(code)) return `error_${code}`;
+  if (error?.message === 'Failed to re-upload media (missing ciphertext)') return 'missing_ciphertext';
+  return 'unknown';
+};
+
 /** A CDN answer that means the file has expired there, and only the phone still has it. */
 const isExpiredMedia = (error: any) => [404, 410].includes(httpStatus(error));
 
@@ -4439,6 +4455,8 @@ export class BaileysStartupService extends ChannelStartupService {
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
     // Set once a download is attempted: whether the phone was asked to re-upload an expired file.
     let reupload: MediaReupload | undefined;
+    // Set when the re-upload failed: why (reuploadRefusal).
+    let reuploadReason: string | undefined;
     try {
       const m = data?.message;
       const convertToMp4 = data?.convertToMp4 ?? false;
@@ -4520,8 +4538,9 @@ export class BaileysStartupService extends ChannelStartupService {
           return updated;
         } catch (error) {
           reupload = 'failed';
+          reuploadReason = reuploadRefusal(error);
           this.logger.warn(
-            `media download: ${media}, outcome=reupload_failed, error=${error?.name ?? 'unknown'}, status=${httpStatus(error)}`,
+            `media download: ${media}, outcome=reupload_failed, error=${error?.name ?? 'unknown'}, status=${httpStatus(error)}, reason=${reuploadReason}`,
           );
           throw error;
         } finally {
@@ -4629,11 +4648,11 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.error('Error processing media message:');
       this.logger.error(error);
       if (reupload === undefined) throw new BadRequestException(error.toString());
-      // The same 400, plus whether the phone was asked to re-upload the file.
+      // The same 400, plus whether the phone was asked to re-upload the file, and why it refused.
       try {
         new BadRequestException(error.toString());
       } catch (badRequest) {
-        throw { ...badRequest, reupload };
+        throw { ...badRequest, reupload, ...(reuploadReason && { reuploadReason }) };
       }
     }
   }

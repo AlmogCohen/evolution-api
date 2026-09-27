@@ -81,6 +81,7 @@ import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
+import { chatState } from '@utils/chat-state';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { jidKind, makeBaileysLogger } from '@utils/log-privacy';
@@ -1128,7 +1129,11 @@ export class BaileysStartupService extends ChannelStartupService {
           unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
         }));
 
-      this.sendDataWebhook(Events.CHATS_UPSERT, chatsToInsert);
+      const stateOf = new Map(chats.map((chat) => [chat.id, chatState(chat)]));
+      this.sendDataWebhook(
+        Events.CHATS_UPSERT,
+        chatsToInsert.map((chat) => ({ ...chat, ...stateOf.get(chat.remoteJid) })),
+      );
 
       if (chatsToInsert.length > 0) {
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS)
@@ -1144,7 +1149,7 @@ export class BaileysStartupService extends ChannelStartupService {
       >[],
     ) => {
       const chatsRaw = chats.map((chat) => {
-        return { remoteJid: chat.id, instanceId: this.instanceId };
+        return { remoteJid: chat.id, instanceId: this.instanceId, ...chatState(chat) };
       });
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
@@ -1359,6 +1364,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         const chatsRaw: { remoteJid: string; instanceId: string; name?: string }[] = [];
+        const chatItems: Record<string, any>[] = [];
         const chatsRepository = new Set(
           (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
             (chat) => chat.remoteJid,
@@ -1371,9 +1377,10 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           chatsRaw.push({ remoteJid: chat.id, instanceId: this.instanceId, name: chat.name });
+          chatItems.push({ ...chatsRaw[chatsRaw.length - 1], ...chatState(chat) });
         }
 
-        this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
+        this.sendDataWebhook(Events.CHATS_SET, chatItems);
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
           await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });

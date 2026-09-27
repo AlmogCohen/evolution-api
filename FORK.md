@@ -46,6 +46,7 @@ named where one exists.
 - Every `contacts.upsert` item says whether its name is the one the owner saved (`saved`), and only when that is certain.
 - Group updates reach subscriptions stored as `GROUP_UPDATE`, in all seven transports and in the global configurations (#2652).
 - Group metadata is filled from `groups.update` instead of queried again for every group on every listing.
+- `chats.update`, `chats.set` and `chats.upsert` items carry the chat's archive, pin and mute state (`archived`, `pinned`, `muteEndTime`) when Baileys has it, and omit a field it does not have rather than guess.
 
 **Messages and privacy**
 - A `getMessage` miss or failed lookup answers nothing, so Baileys no longer relays an empty message on a retry and uses it up (#2705, and #2706 for groups; fixes also offered in #2728 and #2623).

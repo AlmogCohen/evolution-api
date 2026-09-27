@@ -13,7 +13,11 @@ async function serve(mount: string, router: any) {
     res.status(err?.status || 500).json({
       status: err?.status || 500,
       error: err?.error,
-      response: { message: err?.message, ...(err?.reupload !== undefined && { reupload: err.reupload }) },
+      response: {
+        message: err?.message,
+        ...(err?.reupload !== undefined && { reupload: err.reupload }),
+        ...(err?.reuploadReason !== undefined && { reuploadReason: err.reuploadReason }),
+      },
     }),
   );
   const server = app.listen(0, '127.0.0.1');

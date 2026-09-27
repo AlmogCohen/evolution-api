@@ -94,7 +94,8 @@ async function serviceWithPhone(phone: Phone) {
     if (phone === 'fails') {
       // What Baileys raises when the phone reports the file is gone (messages-send.js updateMediaMessage).
       const { Boom } = await import('@hapi/boom');
-      throw new Boom('Media re-upload failed by device (NOT_FOUND)', { statusCode: 404 });
+      // Baileys puts the phone's decoded answer in the Boom's data (its result: 2 is NOT_FOUND).
+      throw new Boom('Media re-upload failed by device (NOT_FOUND)', { data: { stanzaId: message.key.id, result: 2 }, statusCode: 404 });
     }
     // What Baileys does on success: point the message at the new copy (by url
     // alone here, since a directPath is fetched over https from the url's host).
@@ -121,7 +122,13 @@ async function download(service: any, path = GONE) {
 }
 
 const line = (fields: string) => expect.stringContaining(`media download: message=${ID}, chat=user, ${fields}`);
-const badRequest = (reupload: string) => ({ status: 400, error: 'Bad Request', message: [expect.any(String)], reupload });
+const badRequest = (reupload: string, reuploadReason?: string) => ({
+  status: 400,
+  error: 'Bad Request',
+  message: [expect.any(String)],
+  reupload,
+  ...(reuploadReason && { reuploadReason }),
+});
 
 function expectNothingPrivate(out: string) {
   expect(out).not.toContain(PHONE);
@@ -146,10 +153,10 @@ describe('a media download says whether it asked the phone to re-upload', () => 
     const { thrown, out, lines } = await download(service);
 
     expect(asked).toEqual([ID]);
-    expect(thrown).toEqual(badRequest('failed'));
+    expect(thrown).toEqual(badRequest('failed', 'NOT_FOUND'));
     expect(lines).toEqual([
       line('outcome=reupload_requested'),
-      line('outcome=reupload_failed, error=Error, status=404'),
+      line('outcome=reupload_failed, error=Error, status=404, reason=NOT_FOUND'),
       line('outcome=download_failed, status=404, reupload=failed'),
     ]);
     expectNothingPrivate(out);
@@ -190,10 +197,10 @@ describe('an expired media download asks the phone to re-upload, once', () => {
     expect(MEDIA_REUPLOAD_TIMEOUT_MS).toBe(60_000);
     expect(asked).toEqual([ID]);
     expect(cdn.log).toEqual([`GET ${GONE}`]);
-    expect(thrown).toEqual(badRequest('failed'));
+    expect(thrown).toEqual(badRequest('failed', 'no_answer'));
     expect(lines).toEqual([
       line('outcome=reupload_requested'),
-      line('outcome=reupload_failed, error=ReuploadTimeoutError, status=none'),
+      line('outcome=reupload_failed, error=ReuploadTimeoutError, status=none, reason=no_answer'),
       line('outcome=download_failed, status=404, reupload=failed'),
     ]);
     expectNothingPrivate(out);

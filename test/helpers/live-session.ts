@@ -32,13 +32,17 @@ export const ORIGINALS = [
   MESSAGE_SECRET.toString('base64'),
 ];
 
-export const incoming = () =>
-  proto.WebMessageInfo.fromObject({
-    key: { remoteJid: PERSON.lid, remoteJidAlt: PERSON.pn, fromMe: false, id: MESSAGE_ID, addressingMode: 'lid' },
+export const incoming = () => {
+  const info = proto.WebMessageInfo.fromObject({
+    key: { remoteJid: PERSON.lid, fromMe: false, id: MESSAGE_ID },
     messageTimestamp: Long.fromNumber(1758873600, true),
     pushName: PERSON.push,
     message: { conversation: TEXT, messageContextInfo: { messageSecret: new Uint8Array(MESSAGE_SECRET) } },
   });
+  // Not proto fields: Baileys sets them on the decoded key (fromObject would drop them).
+  Object.assign(info.key, { remoteJidAlt: PERSON.pn, addressingMode: 'lid' });
+  return info;
+};
 
 /** What the owner's phone answers a call with, when the instance has a call message set. */
 export const callReply = (jid: string, text: string) =>

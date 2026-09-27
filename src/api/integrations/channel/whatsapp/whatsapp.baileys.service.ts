@@ -1886,8 +1886,14 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
+          // The webhook shows the phone JID as remoteJid, and keeps the @lid WhatsApp stores
+          // the message under in remoteJidAlt (upstream develop's swap), so a consumer can
+          // still name the message the way the phone does (a media re-upload request).
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
+            const lid = messageRaw.key.remoteJid;
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+            messageRaw.key.remoteJidAlt = lid;
+            messageRaw.key.addressingMode = 'pn';
           }
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 

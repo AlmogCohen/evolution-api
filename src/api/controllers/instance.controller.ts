@@ -17,6 +17,18 @@ import { v4 } from 'uuid';
 
 import { ProxyController } from './proxy.controller';
 
+// A logout that could not reach WhatsApp yet: answered 202, and connectionState carries logoutPending: true until it has.
+const LOGOUT_PENDING = {
+  status: 'PENDING',
+  error: false,
+  response: { message: 'Logout pending: WhatsApp will be told when the connection returns' },
+};
+const DELETE_PENDING = {
+  status: 'PENDING',
+  error: false,
+  response: { message: 'Instance deleted; its logout will reach WhatsApp when the connection returns' },
+};
+
 export class InstanceController {
   constructor(
     private readonly waMonitor: WAMonitoringService,
@@ -315,6 +327,11 @@ export class InstanceController {
         throw new BadRequestException('The "' + instanceName + '" instance does not exist');
       }
 
+      // A pending logout owns the connection: answer with that instead of starting a new one.
+      if (instance.logoutPending) {
+        return await this.connectionState({ instanceName });
+      }
+
       if (state == 'open') {
         return await this.connectionState({ instanceName });
       }
@@ -391,10 +408,13 @@ export class InstanceController {
   }
 
   public async connectionState({ instanceName }: InstanceDto) {
+    // A deleted instance whose logout is still on its way to WhatsApp answers here (and only here) until it is.
+    const instance = this.waMonitor.waInstances[instanceName] ?? this.waMonitor.finishingLogouts?.[instanceName];
     return {
       instance: {
         instanceName: instanceName,
-        state: this.waMonitor.waInstances[instanceName]?.connectionStatus?.state,
+        state: instance?.connectionStatus?.state,
+        ...(instance?.logoutPending ? { logoutPending: true } : {}),
       },
     };
   }
@@ -435,13 +455,18 @@ export class InstanceController {
 
   public async logout({ instanceName }: InstanceDto) {
     const { instance } = await this.connectionState({ instanceName });
+    const waInstance = this.waMonitor.waInstances[instanceName];
 
-    if (instance.state === 'close') {
+    if (waInstance?.logoutPending) return LOGOUT_PENDING;
+
+    // "close" is also an instance whose socket dropped and whose linked session is still stored
+    // (a reconnect waiting): that one is logged out, or its reconnect brings the session back.
+    if (instance.state === 'close' && !(await waInstance?.hasSessionToLogOut?.())) {
       throw new BadRequestException('The "' + instanceName + '" instance is not connected');
     }
 
     try {
-      await this.waMonitor.waInstances[instanceName]?.logoutInstance();
+      if ((await waInstance?.logoutInstance()) === 'pending') return LOGOUT_PENDING;
 
       return { status: 'SUCCESS', error: false, response: { message: 'Instance logged out' } };
     } catch (error) {
@@ -455,9 +480,13 @@ export class InstanceController {
       const waInstances = this.waMonitor.waInstances[instanceName];
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
-      if (instance.state === 'connecting' || instance.state === 'open') {
+      let pending = !!waInstances?.logoutPending;
+      if (
+        !pending &&
+        (instance.state === 'connecting' || instance.state === 'open' || (await waInstances?.hasSessionToLogOut?.()))
+      ) {
         try {
-          await this.logout({ instanceName });
+          pending = (await this.logout({ instanceName }))?.status === 'PENDING';
         } catch (error) {
           // A failed logout must not stop the delete. The remove.instance emit
           // below is the only path that purges the in-memory entry and runs
@@ -470,6 +499,13 @@ export class InstanceController {
             error,
           });
         }
+      }
+
+      // The logout has not reached WhatsApp: the instance leaves the API now, keeping only what the
+      // logout needs, and finishes it in the background (WAMonitoringService.deleteKeepingLogout).
+      if (pending) {
+        await this.waMonitor.deleteKeepingLogout(instanceName);
+        return DELETE_PENDING;
       }
 
       try {

@@ -75,6 +75,7 @@ import {
   QrCode,
   S3,
 } from '@config/env.config';
+import { INSTANCE_DIR } from '@config/path.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
@@ -83,6 +84,7 @@ import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { jidKind, makeBaileysLogger } from '@utils/log-privacy';
+import { readLogoutMarker, writeLogoutMarker } from '@utils/logout-marker';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { QueryLimiter } from '@utils/queryLimiter';
@@ -142,6 +144,7 @@ import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
+import { rmSync } from 'fs';
 import Long from 'long';
 import mimeTypes from 'mime-types';
 import NodeCache from 'node-cache';
@@ -261,6 +264,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private connecting: { number: string | null; socket: Promise<WASocket> } | null = null;
   // Stops Evolution listening to the current socket; called before that socket is ended.
   private detachClient?: () => void;
+  // A logout under way. Until it is done the instance forwards and stores nothing, and it connects
+  // only to tell WhatsApp. `marked`: it could not reach WhatsApp, so it is pending, with a marker
+  // (utils/logout-marker.ts) that survives a restart. `deleted`: the instance has left the API.
+  private logout: { marked: boolean; deleted: boolean; settle: (outcome: 'done' | 'pending') => void } | null = null;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   // The dispatcher media downloads go through: the instance's proxy, the same exit as the socket.
@@ -294,32 +301,212 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.stateConnection;
   }
 
-  public async logoutInstance() {
-    this.stopReconnecting();
+  /**
+   * Log the device out on WhatsApp's side (remove-companion-device, which takes it off the person's
+   * Linked devices), then wipe the session. That needs an open socket and the credentials, so when
+   * the socket is down or waiting to reconnect the credentials are kept and the logout is pending
+   * until the connection returns: 'pending'. A session that is not linked has nothing to tell
+   * WhatsApp and is wiped at once.
+   */
+  public async logoutInstance(): Promise<'done' | 'pending'> {
+    // A connect under way finishes first, so the socket logged out is the one it builds.
+    await this.connecting?.socket.catch(() => undefined);
+    if (this.logout?.marked) return 'pending';
+    if (this.logout) return 'done';
+
+    const linked = await this.hasLinkedSession();
     this.messageProcessor.onDestroy();
     this.pictureCache.clear();
+    const socketClosed = this.stateConnection.state === 'close';
+    const outcome = new Promise<'done' | 'pending'>(
+      (settle) => (this.logout = { marked: false, deleted: false, settle }),
+    );
 
-    // Baileys' logout tells WhatsApp to remove this device and then ends the socket.
-    // With the socket down the first step throws ('Connection Closed') and the socket
-    // is never ended. Unlink locally anyway: wipe the credentials, then end the socket
-    // as a logout would. A loggedOut close is final (no reconnect) and runs the same
-    // cleanup as a logout that reached WhatsApp. The device stays listed on the phone.
-    let unreachable = false;
-    try {
-      await this.client?.logout('Log out instance: ' + this.instanceName);
-
-      this.client?.ws?.close();
-    } catch (error) {
-      unreachable = true;
-      this.logger.warn(`Logout could not reach WhatsApp (${error?.message}), unlinking locally`);
+    if (linked) {
+      try {
+        if (this.stateConnection.state !== 'open') throw new Error('the connection is not open');
+        // Sends remove-companion-device, then ends the socket with loggedOut: that close finishes it.
+        await this.client.logout('Log out instance: ' + this.instanceName);
+      } catch (error) {
+        this.logger.warn(`Logout could not reach WhatsApp (${error?.message}): pending until the connection returns`);
+        await this.markLogoutPending();
+      }
+    } else {
+      this.stopReconnecting();
+      try {
+        // Nothing to tell WhatsApp: Baileys only ends the socket, with loggedOut.
+        await this.client?.logout('Log out instance: ' + this.instanceName);
+      } catch {
+        // No socket to end.
+      }
+      // A socket that had already closed announces nothing when ended.
+      if (socketClosed) await this.finishLogout();
     }
 
+    // The loggedOut close normally follows at once; if it never comes, keep the session (pending).
+    let timer: NodeJS.Timeout;
+    const late = new Promise<'late'>((r) => (timer = setTimeout(() => r('late'), 10_000)));
+    const result = await Promise.race([outcome, late]);
+    clearTimeout(timer);
+    if (result === 'late') {
+      await this.markLogoutPending();
+      return 'pending';
+    }
+    return result;
+  }
+
+  /** Whether a logout is pending (it could not reach WhatsApp yet). */
+  public get logoutPending() {
+    return !!this.logout?.marked;
+  }
+
+  /** The instance was deleted while its logout is pending: it finishes out of the API, then removes the rest. */
+  public async markLogoutDeleted() {
+    if (!this.logout) return;
+    this.logout.deleted = true;
+    await this.writeMarker();
+  }
+
+  /** On boot: an instance with a logout marker connects only to finish its logout. Returns whether it had one. */
+  public async resumePendingLogout(): Promise<boolean> {
+    const marker = readLogoutMarker(this.instanceId);
+    if (!marker) return false;
+    this.logout = { marked: true, deleted: !!marker.deleted, settle: () => undefined };
+    this.logger.info(`Resuming a pending logout for instance "${this.instance.name}"`);
+    try {
+      await this.connect(this.phoneNumber);
+    } catch (error) {
+      this.logger.error({ message: 'Connect for a pending logout failed', error: error?.toString() });
+      this.scheduleReconnect();
+    }
+    return true;
+  }
+
+  /** Whether logging out an instance that is not connected has anything to do. */
+  public async hasSessionToLogOut(): Promise<boolean> {
+    if (this.reconnectTimer || this.connecting) return true;
+    return this.hasLinkedSession();
+  }
+
+  /** The instance is removed from the API: no reconnect, and its socket let go of without its close being handled. */
+  public shutdown() {
+    this.stopReconnecting();
+    this.retireClient();
+  }
+
+  /** Whether the stored session is a linked device (creds carry `me`), i.e. whether WhatsApp has something to remove. */
+  private async hasLinkedSession(): Promise<boolean> {
+    const cache = this.configService.get<CacheConf>('CACHE');
+    const provider = this.configService.get<ProviderSession>('PROVIDER');
+    const db = this.configService.get<Database>('DATABASE');
+    if (provider?.ENABLED || (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) || !db.SAVE_DATA.INSTANCE) {
+      return !!this.instance.authState?.state?.creds?.me?.id;
+    }
+    const row = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
+    let creds: any = row?.creds;
+    while (typeof creds === 'string') creds = JSON.parse(creds);
+    return !!creds?.me?.id;
+  }
+
+  private async writeMarker() {
+    try {
+      await writeLogoutMarker(this.instanceId, {
+        instanceName: this.instance.name,
+        deleted: !!this.logout?.deleted,
+        since: new Date().toISOString(),
+      });
+    } catch (error) {
+      // Still pending in this process; only a restart before it is delivered would lose it.
+      this.logger.error({ message: 'Could not write the logout marker', error: error?.toString() });
+    }
+  }
+
+  /** The logout could not reach WhatsApp: keep the session, mark it pending, and reconnect to deliver it. */
+  private async markLogoutPending() {
+    if (!this.logout || this.logout.marked) return;
+    this.logout.marked = true;
+    await this.writeMarker();
+    this.logout.settle('pending');
+    if (!this.reconnectTimer && !this.connecting && this.stateConnection.state === 'close') this.scheduleReconnect();
+  }
+
+  /** A connection.update while a logout is under way: deliver it on open, finish on loggedOut, else reconnect. */
+  private async logoutUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>, from?: WASocket) {
+    if (from && from !== this.client) return;
+    const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+    if (connection) this.stateConnection = { state: connection, statusReason: statusCode ?? 200 };
+
+    // A QR: WhatsApp does not know this device, so there is nothing left to remove.
+    if (qr) return this.finishLogout();
+
+    if (connection === 'open') {
+      this.reconnectAttempts = 0;
+      try {
+        await this.client.logout('Log out instance: ' + this.instanceName);
+      } catch (error) {
+        // The socket dropped before the logout went out: its close reconnects.
+        this.logger.warn(`Pending logout not sent (${error?.message}), trying again on the next connection`);
+      }
+      return;
+    }
+
+    if (connection === 'close') {
+      // loggedOut: the logout went out, or WhatsApp had already removed the device. The other
+      // final codes leave nothing to log out either.
+      if ([DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406].includes(statusCode)) {
+        return this.finishLogout();
+      }
+      if (!this.logout.marked) return this.markLogoutPending();
+      this.scheduleReconnect(statusCode);
+    }
+  }
+
+  /** WhatsApp has been told (or has nothing to remove): wipe the session and the marker, then close as a logout does. */
+  private async finishLogout() {
+    const logout = this.logout;
+    if (!logout) return;
+    this.stopReconnecting();
     try {
       await this.removeSession();
-    } finally {
-      if (unreachable)
-        await this.client?.end(new Boom('Intentional Logout', { statusCode: DisconnectReason.loggedOut }));
+    } catch (error) {
+      // The device is off WhatsApp; the next connection answers loggedOut, which finishes it again.
+      this.logger.error({ message: 'Could not wipe the session after the logout', error: error?.toString() });
+      if (!logout.marked) await this.markLogoutPending();
+      else this.scheduleReconnect();
+      return;
     }
+    rmSync(join(INSTANCE_DIR, this.instanceId), { recursive: true, force: true });
+    this.logout = null;
+
+    if (logout.deleted) {
+      // Out of the API already: remove what was kept for the logout, and announce nothing.
+      await this.prismaRepository.proxy.deleteMany({ where: { instanceId: this.instanceId } }).catch(() => undefined);
+      this.shutdown();
+      this.stateConnection = { state: 'close', statusReason: DisconnectReason.loggedOut };
+      this.eventEmitter.emit('logout.finished', this);
+    } else {
+      // The same close, webhooks and cleanup as a logout that reached WhatsApp at once.
+      await this.connectionUpdate({
+        connection: 'close',
+        lastDisconnect: {
+          error: new Boom('Intentional Logout', { statusCode: DisconnectReason.loggedOut }),
+          date: new Date(),
+        },
+      });
+    }
+    logout.settle('done');
+  }
+
+  // While a logout is under way the instance forwards nothing.
+  public async sendDataWebhook<T extends object = any>(
+    event: Events,
+    data: T,
+    local = true,
+    integration?: string[],
+    extra?: Record<string, any>,
+  ) {
+    if (this.logout) return;
+    return super.sendDataWebhook(event, data, local, integration, extra);
   }
 
   private async removeSession() {
@@ -524,7 +711,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
         this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
+        this.client?.end(new Error('Close connection'));
 
         this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
       }
@@ -827,6 +1014,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   /** A new connect attempt: a fresh QR budget, and no QR or pairing code left from an earlier attempt. */
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    if (this.logout) throw new BadRequestException('A logout is pending: the instance connects only to deliver it');
     this.instance.qrcode = { count: 0 };
     return await this.connect(number);
   }
@@ -1098,7 +1286,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const mappings = [...data.lidPnMappings];
         this.eventProcessingQueue = this.eventProcessingQueue.then(() => {
           try {
-            if (!this.endSession && client === this.client) this.lidMappingHandle(mappings);
+            if (!this.endSession && !this.logout && client === this.client) this.lidMappingHandle(mappings);
           } catch (error) {
             this.logger.error(error);
           }
@@ -2078,6 +2266,12 @@ export class BaileysStartupService extends ChannelStartupService {
       if (client !== this.client) return;
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
+          // A logout under way: nothing is forwarded or stored; the connection only delivers the logout.
+          if (this.logout) {
+            if (events['creds.update']) this.instance.authState.saveCreds();
+            if (events['connection.update']) await this.logoutUpdate(events['connection.update'], client);
+            return;
+          }
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
             // A failed read must not drop the batch (messages, creds, connection updates with it):

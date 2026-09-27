@@ -84,7 +84,8 @@ export class InstanceRouter extends RouterBroker {
           execute: (instance) => instanceController.logout(instance),
         });
 
-        return res.status(HttpStatus.OK).json(response);
+        // A logout still on its way to WhatsApp is accepted, not done.
+        return res.status(response?.status === 'PENDING' ? HttpStatus.ACCEPTED : HttpStatus.OK).json(response);
       })
       .delete(this.routerPath('delete'), ...guards, async (req, res) => {
         const response = await this.dataValidate<InstanceDto>({
@@ -94,7 +95,8 @@ export class InstanceRouter extends RouterBroker {
           execute: (instance) => instanceController.deleteInstance(instance),
         });
 
-        return res.status(HttpStatus.OK).json(response);
+        // A logout still on its way to WhatsApp is accepted, not done.
+        return res.status(response?.status === 'PENDING' ? HttpStatus.ACCEPTED : HttpStatus.OK).json(response);
       });
   }
 

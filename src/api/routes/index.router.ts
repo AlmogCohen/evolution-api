@@ -28,6 +28,7 @@ import { ViewsRouter } from './view.router';
 enum HttpStatus {
   OK = 200,
   CREATED = 201,
+  ACCEPTED = 202,
   NOT_FOUND = 404,
   FORBIDDEN = 403,
   BAD_REQUEST = 400,

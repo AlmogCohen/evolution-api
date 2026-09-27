@@ -1187,7 +1187,7 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       return await this.createClient(this.phoneNumber);
     } catch (error) {
-      this.logger.error(error);
+      this.logger.error({ message: 'Reload connection failed', error: errorFields(error) });
       throw new InternalServerErrorException(error?.toString());
     }
   }

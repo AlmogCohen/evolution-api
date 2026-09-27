@@ -2,11 +2,13 @@
 // the scrubber that made them: it knows only the scrubber's fake ranges.
 //
 //   an address (JID) whose user part is not a fake: 972500<6>, 100000000<6>, 120363<12>
-//   a run of 8+ digits that is neither a fake nor an epoch timestamp (s or ms)
+//   a run of 8+ digits that is neither a fake nor an epoch timestamp (s or ms); under a
+//   message-id key, the scrubber's numeric id fake (two digits, zeros, a short counter) is allowed
 //   a signed media URL (mmg/pps/media*.whatsapp.net, oh= / oe= parameters)
 //   an email address
 //   bytes ({"$bytes"}) of 16+ bytes not tagged fake by the scrubber, and any other
-//   base64 blob of 24+ characters that is not one of those fake bytes
+//   base64 blob of 24+ characters that is not one of those fake bytes (a camelCase
+//   identifier is not a blob)
 //
 // A finding names the file, the line, a masked JSON path and the kind of value,
 // never the value itself. Run on every commit by test/live/fixture-guard.test.ts,
@@ -22,6 +24,11 @@ const WA_DOMAIN = /^(s\.whatsapp\.net|c\.us|g\.us|lid|hosted|hosted\.lid|broadca
 const EMAIL = /[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})/g;
 const SIGNED_URL = /(mmg|pps|media[\w.-]*)\.whatsapp\.net|[?&](oh|oe)=/i;
 const BASE64 = /^[A-Za-z0-9+/]{24,}={0,2}$/;
+/** A camelCase name (receivedPendingNotifications), which BASE64 alone would match. */
+const IDENTIFIER = /^[a-z]+(?:[A-Z][a-z]+)+$/;
+/** The scrubber's fake numeric message id: two digits kept, zeros, a short counter. */
+const FAKE_NUMERIC_ID = /^\d{2}0{3,}[1-9]\d{0,3}$/;
+const ID_KEYS = new Set(['id', 'stanzaId', 'keyId', 'messageId']);
 /** Numbers under these keys are sizes, counts and times, not people. */
 const NUMERIC_KEY = /(length|size|seconds|duration|count|progress|timestamp|time|^t$|^seq$|at$|height|width|expiration|ttl)/i;
 
@@ -42,13 +49,15 @@ function scanString(s: string, report: (kind: string) => void, fakeBytes: Set<st
   for (const run of rest.match(/\d{8,}/g) ?? []) {
     if (!isFakeUser(run) && !isEpoch(run)) report('phone-like digit run');
   }
-  if (BASE64.test(s) && /[a-z]/.test(s) && /[A-Z]/.test(s) && !fakeBytes.has(s)) report('base64 blob');
+  const blob = BASE64.test(s) && /[a-z]/.test(s) && /[A-Z]/.test(s) && !IDENTIFIER.test(s);
+  if (blob && !fakeBytes.has(s)) report('base64 blob');
 }
 
 function walk(value: any, path: string[], report: (kind: string, path: string[]) => void, fakeBytes: Set<string>) {
   const at = (kind: string) => report(kind, path);
   // A commit hash can hold eight digits in a row.
   if (typeof value === 'string' && path[path.length - 1] === 'forkCommit' && /^[0-9a-f]{7,40}(-dirty)?$/.test(value)) return;
+  if (typeof value === 'string' && ID_KEYS.has(path[path.length - 1]) && FAKE_NUMERIC_ID.test(value)) return;
   if (typeof value === 'string') return scanString(value, at, fakeBytes);
   if (typeof value === 'number') {
     const key = path[path.length - 1] ?? '';

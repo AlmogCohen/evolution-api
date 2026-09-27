@@ -1943,7 +1943,13 @@ export class BaileysStartupService extends ChannelStartupService {
                   }
                 }
               } catch (error) {
-                this.logger.error(['Error converting media to base64', error?.message]);
+                // A failed download's error names the signed media link: bounded, scrubbed fields only.
+                this.logger.error({
+                  message: 'Error converting media to base64',
+                  messageId: received.key?.id,
+                  chatType: jidKind(received.key?.remoteJid),
+                  error: errorFields(error),
+                });
               }
             }
           }

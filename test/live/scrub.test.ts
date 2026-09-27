@@ -327,4 +327,21 @@ describe('live-check scrubber', () => {
       ).toBeUndefined();
     }
   });
+
+  it('keeps the markers where a QR or a pairing code was, and stops on a real one an older recording kept', () => {
+    const qrLine = (seq: number, qrcode: object) =>
+      JSON.stringify({ seq, t: 1, event: 'qrcode.updated', data: { qrcode: { instance: 'test', ...qrcode } } }) + '\n';
+    appendFileSync(
+      join(raw, 'webhooks.ndjson'),
+      qrLine(990, { pairingCode: '$pairingCode', code: '$qr', base64: '$qr' }),
+    );
+    const { dir } = scrub();
+    const [marked] = lines(join(dir, 'webhooks.ndjson')).filter((w) => w.seq === 990);
+    expect(marked.data.qrcode).toEqual({ instance: 'test', pairingCode: '$pairingCode', code: '$qr', base64: '$qr' });
+
+    rmSync(out, { recursive: true, force: true });
+    appendFileSync(join(raw, 'webhooks.ndjson'), qrLine(991, { pairingCode: 'WXYZ4321', code: '$qr', base64: '$qr' }));
+    expect(() => scrub()).toThrow(UnknownFieldError);
+    expect(existsSync(out)).toBe(false);
+  });
 });

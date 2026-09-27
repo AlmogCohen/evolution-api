@@ -42,6 +42,11 @@ export const STRUCTURAL: Record<string, (s: string) => boolean> = {
   $proto: (s) => /^proto(\.[A-Z][A-Za-z0-9]*)+$/.test(s),
   as: oneOf('Buffer', 'Uint8Array'),
   $redacted: oneOf('creds'),
+  // What the recorder puts where a QR, its image or a pairing code was (recorder.ts).
+  qr: oneOf('$qr'),
+  code: oneOf('$qr'),
+  base64: oneOf('$qr'),
+  pairingCode: oneOf('$pairingCode'),
   $date: (s) => /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/.test(s),
   $fn: (s) => /^[A-Za-z_$][\w$]{0,40}$/.test(s),
   // Baileys' and Evolution's enums.

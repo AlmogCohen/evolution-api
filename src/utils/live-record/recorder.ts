@@ -160,7 +160,12 @@ export class LiveRecorder {
   /** A payload Evolution sends out (sendDataWebhook), as it was at that moment. */
   webhook(event: string, data: any, extra?: Record<string, any>) {
     this.guard(() => {
-      const line: Record<string, any> = { seq: ++this.seq, t: this.elapsed(), event, data: encode(data) };
+      const line: Record<string, any> = {
+        seq: ++this.seq,
+        t: this.elapsed(),
+        event,
+        data: encode(redactWebhook(data)),
+      };
       if (extra !== undefined) line.extra = encode(extra);
       this.append('webhooks.ndjson', line);
     });
@@ -207,9 +212,28 @@ export class LiveRecorder {
   }
 }
 
-/** Secrets with no replay value never reach the tape: the auth creds and the QR payload. */
+/**
+ * Secrets with no replay value never reach the tape: the auth creds, and whatever links a device
+ * (the QR payload, its image, a pairing code). Replaced before encoding, by a marker that says
+ * one was there.
+ */
 function redact(event: string, data: any) {
   if (event === 'creds.update') return { $redacted: 'creds', keys: Object.keys(data ?? {}) };
   if (event === 'connection.update' && data?.qr) return { ...data, qr: '$qr' };
   return data;
+}
+
+/** qrcode.updated carries the QR payload, its image and the pairing code (connectionUpdate). */
+function redactWebhook(data: any) {
+  const qrcode = data?.qrcode;
+  if (!qrcode || typeof qrcode !== 'object') return data;
+  return {
+    ...data,
+    qrcode: {
+      ...qrcode,
+      ...(qrcode.code ? { code: '$qr' } : {}),
+      ...(qrcode.base64 ? { base64: '$qr' } : {}),
+      ...(qrcode.pairingCode ? { pairingCode: '$pairingCode' } : {}),
+    },
+  };
 }

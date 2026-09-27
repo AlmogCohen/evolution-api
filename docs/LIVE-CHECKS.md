@@ -23,7 +23,9 @@ on. This file is the protocol, the catalogue of checks, and the log of results.
    Values are written in a tagged codec (`src/utils/live-record/codec.ts`) so a
    replay rebuilds identical ones: `$bytes` (Buffer or Uint8Array), `$long`,
    `$u` (undefined), `$proto` (the protobuf class), `$err`, `$date`. The auth
-   creds and the QR payload are redacted when recorded.
+   creds are redacted when recorded, and so is whatever links a device, on both
+   tapes: the QR payload (`$qr`) in `connection.update`, and the QR payload, its
+   image and the pairing code (`$qr`, `$pairingCode`) in `qrcode.updated`.
 2. **Scrub.** `scripts/live-scrub.ts` turns a raw session into
    `test/fixtures/live/<YYYY-MM-DD>-<check-id>/`, then runs a leak gate that
    takes every value of the raw tapes that is not structure and searches the

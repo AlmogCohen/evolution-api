@@ -1366,6 +1366,11 @@ export class BaileysStartupService extends ChannelStartupService {
     }, delay);
   }
 
+  /** A connect failed before it built a socket (so no close will retry it): try again after the backoff. */
+  public retryConnect() {
+    if (!this.reconnectTimer && !this.connecting) this.scheduleReconnect();
+  }
+
   /** Drop a reconnect that is still waiting: the instance is being logged out or deleted. */
   public stopReconnecting() {
     if (this.reconnectTimer) {

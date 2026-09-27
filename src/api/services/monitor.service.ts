@@ -7,6 +7,7 @@ import { CacheConf, Chatwoot, ConfigService, Database, DelInstance, ProviderSess
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR, STORE_DIR } from '@config/path.config';
 import { NotFoundException } from '@exceptions';
+import { errorFields } from '@utils/log-privacy';
 import { readLogoutMarker } from '@utils/logout-marker';
 import { execFileSync } from 'child_process';
 import EventEmitter2 from 'eventemitter2';
@@ -373,18 +374,40 @@ export class WAMonitoringService {
       return;
     }
 
+    // In the API before it connects: a connect that fails (a database read, the network) must not
+    // leave the instance out of it until the process restarts.
+    this.waInstances[instanceData.instanceName] = instance;
+
     if (instanceData.connectionStatus === 'open' || instanceData.connectionStatus === 'connecting') {
       this.logger.info(
         `Auto-connecting instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus})`,
       );
-      await instance.connectToWhatsapp();
+      try {
+        await instance.connectToWhatsapp();
+      } catch (error) {
+        this.logger.error({
+          message: `Auto-connect of instance "${instanceData.instanceName}" failed, retrying`,
+          error: errorFields(error?.cause ?? error),
+        });
+        (instance as any).retryConnect?.();
+      }
     } else {
       this.logger.info(
         `Skipping auto-connect for instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus || 'close'})`,
       );
     }
+  }
 
-    this.waInstances[instanceData.instanceName] = instance;
+  /** setInstance for a loader: awaited, and one instance's failure never stops the others. */
+  private async loadOne(instanceData: InstanceDto) {
+    try {
+      await this.setInstance(instanceData);
+    } catch (error) {
+      this.logger.error({
+        message: `Loading instance "${instanceData.instanceName}" failed`,
+        error: errorFields(error),
+      });
+    }
   }
 
   private async loadInstancesFromRedis() {
@@ -411,7 +434,7 @@ export class WAMonitoringService {
             connectionStatus: instanceData.connectionStatus as any, // Pass connection status
           };
 
-          this.setInstance(instance);
+          await this.loadOne(instance);
         }),
       );
     }
@@ -430,7 +453,7 @@ export class WAMonitoringService {
 
     await Promise.all(
       instances.map(async (instance) => {
-        this.setInstance({
+        await this.loadOne({
           instanceId: instance.id,
           instanceName: instance.name,
           integration: instance.integration,
@@ -457,7 +480,7 @@ export class WAMonitoringService {
           where: { id: instanceId },
         });
 
-        this.setInstance({
+        await this.loadOne({
           instanceId: instance.id,
           instanceName: instance.name,
           integration: instance.integration,

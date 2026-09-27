@@ -4,38 +4,54 @@
 // It works on the tapes as written (the tagged codec, never decoded), in three steps:
 //   1. collect: pair each person's phone JID with their @lid wherever one object
 //      names both, so one person keeps one fake index everywhere;
-//   2. rewrite every string leaf, and every object key that is an address;
-//   3. the leak gate: search the whole output for every original (numbers, names,
-//      byte strings, and every raw string of 4+ characters the rewrite replaced).
-//      One hit aborts, and nothing is written.
+//   2. rewrite every string leaf, every number that could be a person's, and every
+//      object key that is an address. A string under a field no list here knows
+//      stops the scrub: nothing is written, and the error names the field's path;
+//   3. the leak gate (leakGate), independent of what step 2 decided: every value of
+//      the raw tapes that is not structure (live-fields.ts) is searched for in every
+//      value and key of the output. One hit aborts, and nothing is written.
 //
-// What a string becomes:
+// What a value becomes:
 //   phone JID / @lid / group        972500<6> / 100000000<6> / 120363<12>, device suffix kept; index 0 is the owner
-//   a bare number of 7-15 digits    the same person's fake digits (epoch timestamps are kept)
-//   a name (name, notify, pushName, subject...)  "Name <n>", one per distinct original ("Você" kept)
+//   a number of 7-15 digits         the same person's fake digits (kept: epoch timestamps, and sizes and times by field)
+//   a name or a username            "Name <n>", one per distinct original ("Você" kept)
 //   a message id                    same first two characters and length, the rest a counter (digits: zeros, then it)
 //   bytes ($bytes)                  random bytes of the same length and type, tagged fake
 //   a URL                           https://example.invalid/<n>
-//   structure (event names, enums, mimetypes, dates, 3 characters or fewer)   kept
-//   anything else, text included    lorem of the same length
+//   a text (TEXT_KEYS)              lorem of the same length
+//   a location, any other decimal   0.<nnn>, one per distinct original (the tape's own clock, t, is kept)
+//   structure (live-fields.ts)      kept: event names and enums, by field, never by shape alone
+//   anything else                   stops the scrub
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+
+import {
+  isCredsKey,
+  isEpoch,
+  isStructural,
+  LOCATION_KEYS,
+  NUMERIC_KEY,
+  OWNER_LABEL,
+  REPLAY_INSTANCE,
+} from './live-fields';
 
 export type Operator = { phoneModel?: string; osVersion?: string; whatsappAppVersion?: string; countryCode?: string };
 export type ScrubOptions = { checkId: string; date?: string; outRoot?: string; operator?: Operator };
 
 export class LeakError extends Error {}
+/** The scrub stopped on a field it does not know. Names the path, never the value. */
+export class UnknownFieldError extends Error {}
 
 const FAKE_PN = (i: number) => `972500${String(i).padStart(6, '0')}`;
 const FAKE_LID = (i: number) => `100000000${String(i).padStart(6, '0')}`;
 const FAKE_GROUP = (i: number) => `120363${String(i).padStart(12, '0')}`;
 /** Addresses WhatsApp itself uses, never a person's. */
 const SERVICE_USERS = new Set(['0', '16505361212', '13135550002']);
-/** The harness's instance name: a replay runs under it. */
-const REPLAY_INSTANCE = 'test';
 
 const JID = /^(\d+(?:-\d+)?)((?:[:_]\d+)*)@(s\.whatsapp\.net|c\.us|hosted|lid|hosted\.lid|g\.us|broadcast|newsletter)$/;
+const JID_ANYWHERE =
+  /(\d+(?:-\d+)?)(?:[:_]\d+)*@(?:s\.whatsapp\.net|c\.us|hosted\.lid|hosted|lid|g\.us|broadcast|newsletter)/g;
 const PN_SERVERS = new Set(['s.whatsapp.net', 'c.us', 'hosted']);
 const LID_SERVERS = new Set(['lid', 'hosted.lid']);
 
@@ -45,27 +61,22 @@ const NAME_KEYS = words(`
   name notify verifiedName verifiedBizName pushName username subject profileName fullName
   firstName shortName displayName vname
 `);
+/** A username (remoteJidUsername, participantUsername...) is a name. */
+const isNameKey = (key: string) => NAME_KEYS.has(key) || /Username$/.test(key);
 const TEXT_KEYS = words(`
   conversation text caption desc description title body matchedText canonicalUrl fileName address
   contentText footerText headerText vcard selectedDisplayText optionName comment message msgCall
+  messageStubParameters instanceId label directPath
 `);
 const ID_KEYS = words(`
   id stanzaId keyId messageId callId
 `);
-const STRUCTURAL_KEYS = words(`
-  $proto $redacted as event type messageType mimetype addressingMode action connection source
-  origin state status platform mediaType
-`);
 
-const isEpoch = (digits: string) => /^1\d{9}$/.test(digits) || /^1\d{12}$/.test(digits);
-const isStructural = (key: string, s: string) =>
-  s.length <= 3 ||
-  (STRUCTURAL_KEYS.has(key) && !/\s/.test(s) && s.length <= 64) ||
-  /^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+$/.test(s) || // enum names: SERVER_ACK
-  /^[A-Z]{2,12}$/.test(s) || // single-word enums: READ, PLAYED
-  /^[a-z][a-zA-Z0-9]*([._-][a-zA-Z0-9]+)*$/.test(s) || // identifiers: messages.upsert, imageMessage
-  /^[a-z]+\/[\w.+-]+(;\s*[\w=.-]+)*$/.test(s) || // mimetypes
-  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/.test(s); // ISO dates
+const isInstanceKey = (key: string) => key === 'instance' || key === 'instanceName';
+
+/** A path segment that could itself be the personal part (an address or a number used as a key) is masked. */
+const maskSegment = (segment: string) => (/\d{5,}|@/.test(segment) ? '<key>' : segment);
+const pathOf = (path: string[]) => '$.' + path.map(maskSegment).join('.');
 
 const LOREM = 'lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore ';
 
@@ -109,9 +120,7 @@ class Scrubber {
   private bytes = new Map<string, string>();
   private urls = new Map<string, string>();
   private digits = new Map<string, string>();
-  /** Raw strings the rewrite replaced, and raw strings it kept as structure. */
-  readonly replaced = new Set<string>();
-  readonly kept = new Set<string>();
+  private decimals = new Map<string, string>();
 
   constructor(private readonly instanceName: string) {}
 
@@ -139,35 +148,55 @@ class Scrubber {
     if (owner.name) this.names.set(owner.name, 'Owner');
   }
 
-  /** Step 2. */
-  rewrite(value: any, key = ''): any {
-    if (typeof value === 'string') return this.string(value, key);
-    if (typeof value === 'number' && Number.isInteger(value) && value >= 1e6) {
-      const known = this.digits.get(String(value));
-      return known ? Number(known) : value;
-    }
-    if (Array.isArray(value)) return value.map((v) => this.rewrite(v, key));
+  /** Step 2. `path` is where the value sits, for the error when its field is unknown. */
+  rewrite(value: any, key = '', path: string[] = []): any {
+    if (typeof value === 'string') return this.string(value, key, path);
+    if (typeof value === 'number') return this.number(value, key, path);
+    if (Array.isArray(value)) return value.map((v, i) => this.rewrite(v, key, [...path, String(i)]));
     if (!value || typeof value !== 'object') return value;
     if ('$bytes' in value) return { $bytes: this.fakeBytes(value.$bytes), as: value.as, fake: 1 };
-    if ('$long' in value || '$date' in value || '$big' in value || '$u' in value || '$fn' in value) return value;
+    if ('$long' in value) return { ...value, $long: this.digitString(value.$long, key) };
+    if ('$big' in value) return { ...value, $big: this.digitString(value.$big, key) };
+    if ('$u' in value || '$fn' in value || '$date' in value) return value;
+    if ('$redacted' in value) {
+      // A redacted creds.update keeps the names of the creds fields, and nothing else.
+      const keys = Array.isArray(value.keys) ? value.keys : [];
+      const known = value.$redacted === 'creds' && keys.every((k: any) => typeof k === 'string' && isCredsKey(k));
+      if (!known || Object.keys(value).some((k) => k !== '$redacted' && k !== 'keys')) {
+        throw new UnknownFieldError(`unknown field at ${pathOf(path)} (a redacted value): nothing written`);
+      }
+      return { $redacted: value.$redacted, keys };
+    }
     const out: Record<string, any> = {};
     for (const [k, v] of Object.entries(value)) {
-      const newKey = JID.test(k) || /^\d{7,15}$/.test(k) ? this.string(k, '') : k;
-      out[newKey] = this.rewrite(v, k);
+      const newKey = JID.test(k) || /^\d{7,15}$/.test(k) ? this.string(k, '', path) : k;
+      out[newKey] = this.rewrite(v, k, [...path, k]);
     }
     return out;
   }
 
-  private string(s: string, key: string): string {
-    const out = this.stringOf(s, key);
-    if (out === s) this.kept.add(s);
-    else this.replaced.add(s);
-    return out;
+  /** An integer of 7+ digits is a person's unless it is an epoch, or a size or a time by its field; a decimal is a place. */
+  private number(n: number, key: string, path: string[]): number {
+    if (LOCATION_KEYS.has(key) || !Number.isInteger(n)) {
+      // The tape's own clock: milliseconds since the recording started.
+      if (key === 't' && path.length === 1) return n;
+      return this.fakeDecimal(n);
+    }
+    if (Math.abs(n) < 1e6) return n;
+    return Number(this.digitString(String(n), key));
   }
 
-  private stringOf(s: string, key: string): string {
+  private digitString(value: string, key: string): string {
+    const digits = value.replace(/^-/, '');
+    if (digits.length < 7 || !/^\d+$/.test(digits)) return value;
+    if (this.digits.has(digits)) return value.replace(digits, this.digits.get(digits));
+    if (isEpoch(digits) || NUMERIC_KEY.test(key)) return value;
+    return value.replace(digits, this.fakeUser(digits, 's.whatsapp.net'));
+  }
+
+  private string(s: string, key: string, path: string[]): string {
     if (!s) return s;
-    if (s === this.instanceName && (key === 'instance' || key === 'instanceName')) return REPLAY_INSTANCE;
+    if (s === this.instanceName && isInstanceKey(key)) return REPLAY_INSTANCE;
     const jid = JID.exec(s);
     if (jid) return this.fakeJid(jid[1], jid[2], jid[3]);
     // A numeric message id (group notifications have them) is an id, not a person.
@@ -179,13 +208,16 @@ class Scrubber {
       if (isEpoch(digits)) return s;
       return plus + this.fakeUser(digits, 's.whatsapp.net');
     }
-    if (NAME_KEYS.has(key)) return this.fakeName(s);
+    if (isNameKey(key)) return this.fakeName(s);
     if (TEXT_KEYS.has(key)) return this.lorem(s);
     if (this.bytes.has(s)) return this.bytes.get(s);
     if (s.length >= 8 && (ID_KEYS.has(key) || /^(?=.*\d)[0-9A-F]{12,64}$/.test(s))) return this.fakeId(s);
     if (/^https?:\/\//i.test(s)) return this.memo(this.urls, s, (n) => `https://example.invalid/${n}`);
     if (isStructural(key, s)) return s;
-    return this.lorem(s);
+    throw new UnknownFieldError(
+      `unknown field at ${pathOf(path)} (a string of ${s.length} characters): nothing written. ` +
+        'Say what the field is in live-scrub.ts or live-fields.ts, then scrub again.',
+    );
   }
 
   private fakeJid(user: string, suffix: string, server: string) {
@@ -210,7 +242,7 @@ class Scrubber {
   }
 
   private fakeName(s: string) {
-    if (s === 'Você') return s;
+    if (s === OWNER_LABEL) return s;
     return this.memo(this.names, s, (n) => `Name ${n}`);
   }
 
@@ -229,6 +261,10 @@ class Scrubber {
     });
   }
 
+  private fakeDecimal(n: number) {
+    return Number(this.memo(this.decimals, String(n), (i) => `0.${String(((i - 1) % 999) + 1).padStart(3, '0')}`));
+  }
+
   private fakeBytes(b64: string) {
     return this.memo(this.bytes, b64, () => randomBytes(Buffer.from(b64, 'base64').length).toString('base64'));
   }
@@ -245,16 +281,6 @@ class Scrubber {
     return map.get(s);
   }
 
-  /** Every original the gate searches for: numbers, names, byte strings, and replaced strings of 4+ characters. */
-  originals(): string[] {
-    const all = new Set<string>();
-    for (const d of this.digits.keys()) all.add(d);
-    for (const n of this.names.keys()) if (n.length > 3 && n !== 'Você') all.add(n);
-    for (const b of this.bytes.keys()) if (b.length > 3) all.add(b);
-    for (const s of this.replaced) if (s.length > 3 && !this.kept.has(s)) all.add(s);
-    return [...all];
-  }
-
   counts() {
     return {
       people: this.people.count,
@@ -264,8 +290,85 @@ class Scrubber {
       messageIds: this.ids.size,
       bytes: this.bytes.size,
       urls: this.urls.size,
+      decimals: this.decimals.size,
     };
   }
+}
+
+/**
+ * Step 3, the leak gate. It reads the raw tapes itself and decides on its own what in them could be
+ * a person's: every string of 4+ characters that is not structure by its field (live-fields.ts),
+ * the user part of every address, every run of 7+ digits that is not an epoch, every integer of
+ * 7+ digits that is not an epoch or a size or a time by its field, every decimal but the tape's
+ * clock, every byte string. Then it looks for each of them in every string, number and key of the
+ * output. It never asks the scrubber what it replaced. Returns the hits, as file and line only.
+ */
+export function leakGate(
+  raw: { events: Line[]; webhooks: Line[]; owner?: Record<string, any>; instanceName: string },
+  files: Record<string, string>,
+): string[] {
+  const originals = new Set<string>();
+  const addDigits = (digits: string, key = '') => {
+    if (digits.length >= 7 && !isEpoch(digits) && !SERVICE_USERS.has(digits) && !NUMERIC_KEY.test(key)) {
+      originals.add(digits);
+    }
+  };
+  const addString = (s: string, key: string) => {
+    if (!s || s === OWNER_LABEL || isStructural(key, s)) return;
+    if (s === raw.instanceName && isInstanceKey(key)) return;
+    for (const m of s.matchAll(JID_ANYWHERE)) for (const part of m[1].split('-')) addDigits(part);
+    for (const run of s.match(/\d{7,}/g) ?? []) addDigits(run);
+    if (s.length >= 4) originals.add(s);
+  };
+  const walk = (value: any, key: string, depth: number) => {
+    if (typeof value === 'string') return addString(value, key);
+    if (typeof value === 'number') {
+      if (Number.isInteger(value) && !LOCATION_KEYS.has(key)) return addDigits(String(Math.abs(value)), key);
+      if (key === 't' && depth === 1) return;
+      return void originals.add(String(value));
+    }
+    if (Array.isArray(value)) return value.forEach((v) => walk(v, key, depth + 1));
+    if (!value || typeof value !== 'object') return;
+    if (typeof value.$bytes === 'string') return void (value.$bytes.length >= 4 && originals.add(value.$bytes));
+    if (typeof value.$long === 'string') return addDigits(value.$long.replace(/^-/, ''), key);
+    if (typeof value.$big === 'string') return addDigits(value.$big.replace(/^-/, ''), key);
+    if ('$u' in value || '$fn' in value || '$date' in value || '$redacted' in value) return;
+    for (const [k, v] of Object.entries(value)) {
+      if (JID.test(k) || /^\d{7,15}$/.test(k)) addString(k, '');
+      walk(v, k, depth + 1);
+    }
+  };
+  for (const line of [...raw.events, ...raw.webhooks]) walk(line, '', 0);
+  const owner = raw.owner ?? {};
+  for (const key of ['id', 'lid', 'name']) if (typeof owner[key] === 'string') addString(owner[key], key);
+  const searched = [...originals];
+
+  const hits: string[] = [];
+  for (const [file, text] of Object.entries(files)) {
+    const units = file.endsWith('.ndjson')
+      ? text.split('\n').flatMap((l, i): [number, any][] => (l.trim() ? [[i + 1, JSON.parse(l)]] : []))
+      : [[1, JSON.parse(text)] as [number, any]];
+    for (const [line, unit] of units) {
+      let hit = false;
+      const check = (s: string) => {
+        if (!hit && searched.some((o) => s.includes(o))) hit = true;
+      };
+      const scan = (value: any, key: string) => {
+        if (hit) return;
+        if (typeof value === 'string') return isStructural(key, value) ? undefined : check(value);
+        if (typeof value === 'number') return check(String(value));
+        if (Array.isArray(value)) return value.forEach((v) => scan(v, key));
+        if (!value || typeof value !== 'object') return;
+        for (const [k, v] of Object.entries(value)) {
+          check(k);
+          scan(v, k);
+        }
+      };
+      scan(unit, '');
+      if (hit) hits.push(`${file} line ${line}`);
+    }
+  }
+  return hits;
 }
 
 const readLines = (file: string): Line[] =>
@@ -275,9 +378,6 @@ const readLines = (file: string): Line[] =>
         .filter((l) => l.trim())
         .map((l) => JSON.parse(l))
     : [];
-
-const describeOriginal = (s: string) =>
-  /^\d+$/.test(s) ? `a number of ${s.length} digits` : `a string of ${s.length} characters`;
 
 /** Scrub one raw session. Returns the fixture directory; throws LeakError (writing nothing) on a leak. */
 export function scrubSession(rawDir: string, opts: ScrubOptions) {
@@ -318,16 +418,11 @@ export function scrubSession(rawDir: string, opts: ScrubOptions) {
   files['manifest.json'] = JSON.stringify(manifest, null, 2) + '\n';
 
   // Step 3, the leak gate: fail closed.
-  const hits: string[] = [];
-  for (const original of scrubber.originals()) {
-    const escaped = JSON.stringify(original).slice(1, -1);
-    for (const [file, text] of Object.entries(files)) {
-      const at = text.includes(original) ? text.indexOf(original) : text.indexOf(escaped);
-      if (at >= 0) hits.push(`${file} line ${text.slice(0, at).split('\n').length}: ${describeOriginal(original)}`);
-    }
-  }
+  const hits = leakGate({ events, webhooks, owner, instanceName }, files);
   if (hits.length) {
-    throw new LeakError(`leak gate: ${hits.length} original(s) survived, nothing written:\n  ${hits.join('\n  ')}`);
+    throw new LeakError(
+      `leak gate: an original survived in ${hits.length} place(s), nothing written:\n  ${hits.join('\n  ')}`,
+    );
   }
 
   const report = { leakGate: 'pass', events: events.length, webhooks: webhooks.length, ...scrubber.counts() };

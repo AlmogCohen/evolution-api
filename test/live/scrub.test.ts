@@ -17,7 +17,16 @@ vi.mock('@utils/fetchLatestWaWebVersion', () => ({
   fetchLatestWaWebVersion: async () => ({ version: [2, 3000, 1], isLatest: true }),
 }));
 
-import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -28,7 +37,7 @@ import { decode } from '@utils/live-record/codec';
 import { fakeSocket } from '../helpers/connect';
 import { emitted } from '../helpers/fake-server-module';
 import { MESSAGE_ID, MESSAGE_SECRET, ORIGINALS, PERSON, recordSession, TEXT } from '../helpers/live-session';
-import { scrubSession } from '../tools/live-scrub';
+import { leakGate, scrubSession, UnknownFieldError } from '../tools/live-scrub';
 
 socketSpy.mockImplementation(fakeSocket);
 
@@ -278,5 +287,44 @@ describe('live-check scrubber', () => {
       expect(message.includes('dana.levi')).toBe(false);
       expect(existsSync(out)).toBe(false);
     });
+  });
+
+  it('its leak gate reads the raw tapes itself: a value the scrubber had kept still fails it', () => {
+    const line = {
+      seq: 1,
+      t: 1,
+      socket: 1,
+      event: 'messages.upsert',
+      data: { messages: [{ key: { remoteJidUsername: 'dana.levi88' } }] },
+    };
+    const raw = { events: [line], webhooks: [], instanceName: 'rig' };
+    // As if a rewrite had kept every value.
+    expect(leakGate(raw, { 'events.ndjson': JSON.stringify(line) + '\n' })).toEqual(['events.ndjson line 1']);
+    // Structure it keeps is not a leak.
+    const structure = { seq: 1, t: 1.5, socket: 1, event: 'connection.update', data: { connection: 'open' } };
+    const clean = { events: [structure], webhooks: [], instanceName: 'rig' };
+    expect(leakGate(clean, { 'events.ndjson': JSON.stringify(structure) + '\n' })).toEqual([]);
+  });
+
+  it('knows every field of every committed fixture', () => {
+    // A committed fixture has the raw tapes' shape: scrubbing it again must not meet an unknown field.
+    const root = join(process.cwd(), 'test', 'fixtures', 'live');
+    for (const fixture of readdirSync(root)) {
+      const again = join(tmpdir(), `live-rescrub-${process.pid}`, 'test', fixture);
+      mkdirSync(again, { recursive: true });
+      for (const file of ['events.ndjson', 'webhooks.ndjson', 'manifest.json']) {
+        writeFileSync(join(again, file), readFileSync(join(root, fixture, file)));
+      }
+      let error: unknown;
+      try {
+        scrubSession(again, { checkId: 'rescrub', date: '2026-09-27', outRoot: join(again, 'out') });
+      } catch (e) {
+        error = e; // Its fakes are originals now, so the leak gate may object; an unknown field may not.
+      }
+      rmSync(join(tmpdir(), `live-rescrub-${process.pid}`), { recursive: true, force: true });
+      expect(
+        error instanceof UnknownFieldError ? `${fixture}: ${(error as Error).message}` : undefined,
+      ).toBeUndefined();
+    }
   });
 });

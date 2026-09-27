@@ -9,12 +9,19 @@
 //   bytes ({"$bytes"}) of 16+ bytes not tagged fake by the scrubber, and any other
 //   base64 blob of 24+ characters that is not one of those fake bytes (a camelCase
 //   identifier is not a blob)
+//   in a tape (.ndjson), any string that is neither one of the scrubber's fakes (a fake
+//   address, "Name <n>", lorem, an example.invalid URL, a fake message id) nor a value
+//   its field is known to take (live-fields.ts): a username, a group name, a value in
+//   a field nobody listed. And any decimal number but the tape's own clock (t) and the
+//   scrubber's fake decimals (0.<nnn>): a location.
 //
 // A finding names the file, the line, a masked JSON path and the kind of value,
 // never the value itself. Run on every commit by test/live/fixture-guard.test.ts,
 // and by scripts/live-guard.ts from lint-staged.
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative } from 'node:path';
+
+import { isCredsKey, isStructural, OWNER_LABEL } from './live-fields';
 
 export type Finding = { file: string; line: number; path: string; kind: string };
 
@@ -30,7 +37,31 @@ const IDENTIFIER = /^[a-z]+(?:[A-Z][a-z]+)+$/;
 const FAKE_NUMERIC_ID = /^\d{2}0{3,}[1-9]\d{0,3}$/;
 const ID_KEYS = new Set(['id', 'stanzaId', 'keyId', 'messageId']);
 /** Numbers under these keys are sizes, counts and times, not people. */
-const NUMERIC_KEY = /(length|size|seconds|duration|count|progress|timestamp|time|^t$|^seq$|at$|height|width|expiration|ttl)/i;
+const NUMERIC_KEY =
+  /(length|size|seconds|duration|count|progress|timestamp|time|^t$|^seq$|at$|height|width|expiration|ttl)/i;
+
+const LOREM =
+  'lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore '.repeat(64);
+const FAKE_NAME = /^Name \d+$/;
+const FAKE_URL = /^https:\/\/example\.invalid\/\d+$/;
+/** The scrubber's fake id: two characters kept, then a hex counter padded with F (f), or digits: zeros, a counter. */
+const FAKE_ID = /^.{2}(?:F*[0-9A-F]{1,8}|f*[0-9a-f]{1,8})$/;
+const WHOLE_JID =
+  /^\d+(?:-\d+)?(?:[:_]\d+)*@(s\.whatsapp\.net|c\.us|hosted\.lid|hosted|lid|g\.us|broadcast|newsletter)$/;
+/** The scrubber's fake decimal: 0.001 to 0.999. */
+const FAKE_DECIMAL = /^0\.\d{1,3}$/;
+
+/** A tape string the scrubber wrote or kept on purpose: one of its fakes, or a value its field takes. */
+const isKnownValue = (key: string, s: string) =>
+  s === '' ||
+  s === 'Owner' ||
+  s === OWNER_LABEL ||
+  FAKE_NAME.test(s) ||
+  FAKE_URL.test(s) ||
+  WHOLE_JID.test(s) ||
+  LOREM.includes(s) ||
+  ((ID_KEYS.has(key) || s.length >= 12) && (FAKE_ID.test(s) || FAKE_NUMERIC_ID.test(s))) ||
+  isStructural(key, s);
 
 const isEpoch = (d: string) => /^1\d{9}$/.test(d) || /^1\d{12}$/.test(d);
 const isFakeUser = (user: string) =>
@@ -53,31 +84,55 @@ function scanString(s: string, report: (kind: string) => void, fakeBytes: Set<st
   if (blob && !fakeBytes.has(s)) report('base64 blob');
 }
 
-function walk(value: any, path: string[], report: (kind: string, path: string[]) => void, fakeBytes: Set<string>) {
+/** The field a value belongs to: the last path segment that is not an array index. */
+const fieldOf = (path: string[]) => [...path].reverse().find((p) => !/^\d+$/.test(p)) ?? '';
+
+function walk(
+  value: any,
+  path: string[],
+  report: (kind: string, path: string[]) => void,
+  fakeBytes: Set<string>,
+  tape: boolean,
+) {
   const at = (kind: string) => report(kind, path);
+  const key = fieldOf(path);
   // A commit hash can hold eight digits in a row.
-  if (typeof value === 'string' && path[path.length - 1] === 'forkCommit' && /^[0-9a-f]{7,40}(-dirty)?$/.test(value)) return;
+  if (typeof value === 'string' && path[path.length - 1] === 'forkCommit' && /^[0-9a-f]{7,40}(-dirty)?$/.test(value))
+    return;
   if (typeof value === 'string' && ID_KEYS.has(path[path.length - 1]) && FAKE_NUMERIC_ID.test(value)) return;
-  if (typeof value === 'string') return scanString(value, at, fakeBytes);
+  if (typeof value === 'string') {
+    let found = false;
+    scanString(value, (kind) => ((found = true), at(kind)), fakeBytes);
+    if (tape && !found && !isKnownValue(key, value)) at('value that is neither a fake nor known structure');
+    return;
+  }
   if (typeof value === 'number') {
-    const key = path[path.length - 1] ?? '';
+    if (tape && !Number.isInteger(value) && !(key === 't' && path.length === 1) && !FAKE_DECIMAL.test(String(value))) {
+      return at('decimal number (a location?)');
+    }
     if (!NUMERIC_KEY.test(key)) scanString(String(value), at, fakeBytes);
     return;
   }
-  if (Array.isArray(value)) return value.forEach((v, i) => walk(v, [...path, String(i)], report, fakeBytes));
+  if (Array.isArray(value)) return value.forEach((v, i) => walk(v, [...path, String(i)], report, fakeBytes, tape));
   if (!value || typeof value !== 'object') return;
   if (typeof value.$bytes === 'string') {
     if (!value.fake && Buffer.from(value.$bytes, 'base64').length >= 16) at('bytes not tagged fake');
     return;
   }
   if (typeof value.$long === 'string') {
-    const key = path[path.length - 1] ?? '';
     if (!NUMERIC_KEY.test(key)) scanString(value.$long.replace('-', ''), at, fakeBytes);
+    return;
+  }
+  if (typeof value.$redacted === 'string') {
+    const keys = Array.isArray(value.keys) ? value.keys : [];
+    if (tape && !keys.every((k: any) => typeof k === 'string' && isCredsKey(k))) {
+      at('value that is neither a fake nor known structure');
+    }
     return;
   }
   for (const [k, v] of Object.entries(value)) {
     scanString(k, (kind) => report(kind, [...path, k]), fakeBytes);
-    walk(v, [...path, k], report, fakeBytes);
+    walk(v, [...path, k], report, fakeBytes, tape);
   }
 }
 
@@ -127,6 +182,7 @@ export function scanFixtures(...paths: string[]): Finding[] {
         (kind, path) =>
           findings.push({ file: relative(process.cwd(), file), line, path: '$.' + path.map(mask).join('.'), kind }),
         fakeBytes,
+        file.endsWith('.ndjson'),
       );
     }
   }

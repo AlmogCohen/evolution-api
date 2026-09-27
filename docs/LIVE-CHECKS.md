@@ -26,7 +26,8 @@ on. This file is the protocol, the catalogue of checks, and the log of results.
    creds and the QR payload are redacted when recorded.
 2. **Scrub.** `scripts/live-scrub.ts` turns a raw session into
    `test/fixtures/live/<YYYY-MM-DD>-<check-id>/`, then runs a leak gate that
-   searches the output for every original and writes nothing if one survives.
+   takes every value of the raw tapes that is not structure and searches the
+   output for it, and writes nothing if one survives.
 3. **Replay.** `test/helpers/live-replay.ts` feeds the fixture's events through
    Baileys' real event buffer (buffered where they were) into the real
    `BaileysStartupService`, and `compareGolden` compares what Evolution sends
@@ -91,17 +92,30 @@ npx tsx scripts/live-guard.ts
 ```
 
 The scrubber prints the fixture directory and a report of counts. It exits 1
-and writes nothing when its leak gate finds an original in the output: fix the
-scrubber (a new field it does not know, most often), never the fixture. Delete
-the raw session once the fixture is committed.
+and writes nothing when it meets a string under a field it does not know (the
+error names the field's path, never the value), or when its leak gate finds an
+original in the output: say what the field is in `test/tools/live-scrub.ts` or
+`test/tools/live-fields.ts`, never in the fixture, and scrub again. Delete the
+raw session once the fixture is committed.
+
+The leak gate does not ask the scrubber what it replaced. It reads the raw tapes
+itself and searches every value and key of the output for each string of 4+
+characters that is not structure, the user part of every address, every run of
+7+ digits that is not an epoch, every decimal but the tape's clock, and every
+byte string.
 
 What the scrubber does: one person keeps one fake index across their phone JID,
 @lid and device suffix (the owner is index 0, `972500000000`); names keep
 equality (a saved name and a profile name stay different, the same name stays
 the same); message ids keep their first two characters and length (Evolution
 reads the device from them); bytes keep their length and type, with random
-content, so a replay test must never depend on real crypto; text becomes lorem
-of the same length; URLs become `https://example.invalid/<n>`.
+content, so a replay test must never depend on real crypto; text (a stub
+parameter included) becomes lorem of the same length; a username becomes a fake
+name; URLs become `https://example.invalid/<n>`; a location, and any decimal but
+the tape's clock, becomes `0.<nnn>`. A string is kept as written only under a
+field `test/tools/live-fields.ts` lists, and only with a value that field is
+known to take (event names, Baileys' and Evolution's enums), never because it
+looks like an identifier.
 
 **Add the fixture and its replay test.** Put the test next to the behaviour it
 covers, and assert the exact thing the check is about, then the whole output:
@@ -153,8 +167,10 @@ touches `test/fixtures/live/`:
 
 `test/live/fixture-guard.test.ts` runs the same guard over
 `test/fixtures/live/` in CI on every commit, and lint-staged runs it on staged
-fixture files. The guard knows only what personal data looks like: it cannot
-recognise a name or a text, which is why the skim is not optional.
+fixture files. In a tape it accepts only the scrubber's fakes and the values
+`live-fields.ts` lists by field, and flags any other string and any decimal
+number. It still cannot tell a name the scrubber mistook for structure from
+structure, which is why the skim is not optional.
 
 ## Check catalogue
 

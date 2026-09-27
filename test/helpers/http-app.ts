@@ -40,3 +40,15 @@ export async function startInstanceApp() {
   const guards = [instanceExistsGuard, instanceLoggedGuard, authGuard['apikey']];
   return serve('/instance', new InstanceRouter(configService, ...guards).router);
 }
+
+/**
+ * Only /chat, behind the same guards, for a test that fakes the server module and
+ * hands the router its own chatController (whose monitor holds the service).
+ */
+export async function startChatApp() {
+  await import('@api/routes/index.router');
+  const { ChatRouter } = await import('@api/routes/chat.router');
+  const { authGuard } = await import('@api/guards/auth.guard');
+  const { instanceExistsGuard, instanceLoggedGuard } = await import('@api/guards/instance.guard');
+  return serve('/chat', new ChatRouter(instanceExistsGuard, instanceLoggedGuard, authGuard['apikey']).router);
+}

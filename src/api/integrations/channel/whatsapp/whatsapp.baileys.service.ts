@@ -84,7 +84,7 @@ import { Instance, Message } from '@prisma/client';
 import { chatState } from '@utils/chat-state';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
-import { jidKind, makeBaileysLogger } from '@utils/log-privacy';
+import { errorFields, jidKind, makeBaileysLogger } from '@utils/log-privacy';
 import { readLogoutMarker, writeLogoutMarker } from '@utils/logout-marker';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
@@ -1145,8 +1145,13 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return await this.createClient(number);
     } catch (error) {
-      this.logger.error(error);
-      throw new InternalServerErrorException(error?.toString());
+      this.logger.error({ message: 'Connect failed', error: errorFields(error) });
+      // The same 500, still carrying what failed (not enumerable, so not in an HTTP answer): a reconnect logs it.
+      try {
+        new InternalServerErrorException(error?.toString());
+      } catch (serverError) {
+        throw Object.defineProperty(serverError, 'cause', { value: error, enumerable: false });
+      }
     }
   }
 
@@ -1164,7 +1169,7 @@ export class BaileysStartupService extends ChannelStartupService {
         await this.connect(this.phoneNumber);
       } catch (error) {
         // No socket was built, so no close will come to retry it: schedule the next attempt here.
-        this.logger.error({ message: 'Reconnect attempt failed', error: error?.toString() });
+        this.logger.error({ message: 'Reconnect attempt failed', error: errorFields(error?.cause ?? error) });
         this.scheduleReconnect(statusCode);
       }
     }, delay);

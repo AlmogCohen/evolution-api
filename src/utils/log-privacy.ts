@@ -27,6 +27,26 @@ export function scrub(value: unknown): string {
     .replace(/\d{6,}/g, '[number]');
 }
 
+/**
+ * What an operator needs to know about a thrown value, bounded and scrubbed:
+ * its name (for a value that is not an Error, what it is: Object, string...),
+ * its message, and its HTTP status code when it carries one (a Boom's
+ * output.statusCode, or statusCode / status).
+ */
+export function errorFields(error: unknown): { name: string; message: string; statusCode?: number } {
+  const e: any = error;
+  let name: string = typeof e;
+  if (typeof e?.name === 'string') name = e.name;
+  else if (e !== null && typeof e === 'object') name = e.constructor?.name ?? 'Object';
+  const message = typeof e?.message === 'string' ? e.message : typeof e === 'string' ? e : '';
+  const statusCode = [e?.output?.statusCode, e?.statusCode, e?.status].find((v) => typeof v === 'number');
+  return {
+    name: scrub(name).slice(0, 40),
+    message: scrub(message).slice(0, 200),
+    ...(statusCode !== undefined && { statusCode }),
+  };
+}
+
 const PRIMITIVE_FIELDS = ['messageType', 'isSessionRecordError', 'opName', 'count', 'attempt', 'retryCount'];
 const ERROR_FIELDS = ['err', 'error', 'ackErr'];
 

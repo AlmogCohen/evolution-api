@@ -1961,7 +1961,12 @@ export class BaileysStartupService extends ChannelStartupService {
         try {
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
+            // A failed read must not drop the batch (messages, creds, connection updates with it):
+            // fall back to the settings loaded at connect and kept by setSettings.
+            const settings = await this.findSettings().catch((error) => {
+              this.logger.warn(`Settings read failed, using the last known settings: ${error?.message ?? error}`);
+              return { ...this.localSettings };
+            });
 
             if (events.call) {
               const call = events.call[0];

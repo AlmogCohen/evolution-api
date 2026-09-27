@@ -10,17 +10,22 @@ import { applyProfile, type Profile } from './profiles';
 
 export const WUID = '972500000000@s.whatsapp.net';
 
-export async function makeService(opts: { profile?: Profile } = {}) {
+/**
+ * `prisma` and `eventEmitter` default to fresh ones. Pass the ones the rest of a
+ * test uses (the server module's Prisma, the monitor's emitter) when the service
+ * must share them, as it does in production.
+ */
+export async function makeService(opts: { profile?: Profile; prisma?: any; eventEmitter?: EventEmitter2 } = {}) {
   applyProfile(opts.profile ?? 'minimal');
   const { BaileysStartupService } = await import('@api/integrations/channel/whatsapp/whatsapp.baileys.service');
   const { CacheService } = await import('@api/services/cache.service');
   const { LocalCache } = await import('@cache/localcache');
   const { ConfigService } = await import('@config/env.config');
   const configService = new ConfigService();
-  const prisma = fakePrisma();
+  const prisma = opts.prisma ?? fakePrisma();
   const cache = new CacheService(new LocalCache(configService, 'instance'));
   const baileysCache = new CacheService(new LocalCache(configService, 'baileys'));
-  const service: any = new BaileysStartupService(configService, new EventEmitter2(), prisma, cache, null as any, baileysCache, null as any);
+  const service: any = new BaileysStartupService(configService, opts.eventEmitter ?? new EventEmitter2(), prisma, cache, null as any, baileysCache, null as any);
   service.setInstance({ instanceName: 'test', instanceId: 'inst-1', integration: 'WHATSAPP-BAILEYS' });
   const ev = makeEventBuffer(P({ level: 'silent' }) as any);
   service.client = {

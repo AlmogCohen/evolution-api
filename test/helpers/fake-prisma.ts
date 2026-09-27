@@ -79,6 +79,13 @@ export function fakePrisma() {
     proxy: table('proxy', (r) => r.instanceId),
     webhook: table('webhook', (r) => r.instanceId),
     chatwoot: table('chatwoot', (r) => r.instanceId),
+    // The rest of what deleting an instance clears (monitor.service.ts cleaningStoreData).
+    rabbitmq: table('rabbitmq', (r) => r.instanceId),
+    nats: table('nats', (r) => r.instanceId),
+    sqs: table('sqs', (r) => r.instanceId),
+    integrationSession: table('integrationSession', () => undefined),
+    typebot: table('typebot', () => undefined),
+    websocket: table('websocket', (r) => r.instanceId),
   };
   db.$transaction = async (ops: any) => (typeof ops === 'function' ? ops(db) : Promise.all(ops));
   db.$queryRaw = async () => [];

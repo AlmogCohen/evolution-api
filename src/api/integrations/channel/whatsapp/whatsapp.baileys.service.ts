@@ -252,6 +252,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  // The dispatcher media downloads go through: the instance's proxy, the same exit as the socket.
+  private mediaProxy?: { key: string; dispatcher: ReturnType<typeof makeProxyAgentUndici> };
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -641,6 +643,8 @@ export class BaileysStartupService extends ChannelStartupService {
         };
       }
     }
+
+    if (options?.fetchAgent) this.mediaProxy = { key: this.proxyKey(), dispatcher: options.fetchAgent };
 
     const socketConfig: UserFacingSocketConfig = {
       ...options,
@@ -1519,7 +1523,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 const buffer = await downloadMediaMessage(
                   { key: received.key, message: received?.message },
                   'buffer',
-                  {},
+                  this.mediaDownloadOptions(),
                   { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
                 );
 
@@ -1530,7 +1534,7 @@ export class BaileysStartupService extends ChannelStartupService {
                   const buffer = await downloadMediaMessage(
                     { key: received.key, message: received?.message },
                     'buffer',
-                    {},
+                    this.mediaDownloadOptions(),
                     { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
                   );
 
@@ -2594,7 +2598,7 @@ export class BaileysStartupService extends ChannelStartupService {
             const buffer = await downloadMediaMessage(
               { key: messageRaw.key, message: messageRaw?.message },
               'buffer',
-              {},
+              this.mediaDownloadOptions(),
               { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
             );
 
@@ -2605,7 +2609,7 @@ export class BaileysStartupService extends ChannelStartupService {
               const buffer = await downloadMediaMessage(
                 { key: messageRaw.key, message: messageRaw?.message },
                 'buffer',
-                {},
+                this.mediaDownloadOptions(),
                 { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
               );
 
@@ -3913,6 +3917,37 @@ export class BaileysStartupService extends ChannelStartupService {
     return map[mediaType] || null;
   }
 
+  private proxyKey() {
+    const { protocol, host, port, username, password } = this.localProxy;
+    return JSON.stringify([protocol, host, port, username, password]);
+  }
+
+  /**
+   * Options for Baileys' media downloads. Baileys downloads with fetch, which
+   * ignores the socket's `agent`/`fetchAgent` and routes only through a
+   * `dispatcher`, so without this the media leaves from the server's own IP
+   * while the messages leave through the instance's proxy.
+   */
+  private mediaDownloadOptions() {
+    if (!this.localProxy?.enabled || !this.localProxy.host) return {};
+    const key = this.proxyKey();
+    if (this.mediaProxy?.key !== key) {
+      // A proxyscrape host is a list the socket picked one exit from; only the socket's own dispatcher is that exit.
+      if (this.localProxy.host.includes('proxyscrape')) return {};
+      this.mediaProxy = {
+        key,
+        dispatcher: makeProxyAgentUndici({
+          host: this.localProxy.host,
+          port: this.localProxy.port,
+          protocol: this.localProxy.protocol,
+          username: this.localProxy.username,
+          password: this.localProxy.password,
+        }),
+      };
+    }
+    return { options: { dispatcher: this.mediaProxy.dispatcher } as RequestInit };
+  }
+
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
     try {
       const m = data?.message;
@@ -3978,7 +4013,7 @@ export class BaileysStartupService extends ChannelStartupService {
         buffer = await downloadMediaMessage(
           { key: msg?.key, message: msg?.message },
           'buffer',
-          {},
+          this.mediaDownloadOptions(),
           { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
         );
       } catch {
@@ -3995,7 +4030,7 @@ export class BaileysStartupService extends ChannelStartupService {
               url: `https://mmg.whatsapp.net${msg?.message?.[mediaType]?.directPath}`,
             },
             await this.mapMediaType(mediaType),
-            {},
+            this.mediaDownloadOptions(),
           );
           const chunks = [];
           for await (const chunk of media) {

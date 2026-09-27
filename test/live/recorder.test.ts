@@ -126,7 +126,9 @@ describe('live-check recorder', () => {
     expect(Long.isLong(message.messageTimestamp)).toBe(true);
     expect(message.message.conversation).toBe(TEXT);
     expect(message.message.messageContextInfo.messageSecret).toBeInstanceOf(Uint8Array);
-    expect(decode(emits[2].data)).toEqual([{ id: PERSON.pn, lid: PERSON.lid, name: PERSON.saved, notify: PERSON.push }]);
+    expect(decode(emits[2].data)).toEqual([
+      { id: PERSON.pn, lid: PERSON.lid, name: PERSON.saved, notify: PERSON.push },
+    ]);
 
     // The auth creds never reach the tape.
     expect(emits[1].data).toEqual({ $redacted: 'creds', keys: ['me'] });
@@ -179,7 +181,15 @@ describe('live-check recorder', () => {
       endedAt: null,
     });
     const text = JSON.stringify(manifest);
-    for (const secret of ['972529998877', '987654321098765', '972541112233', '123456789012345', OWNER.name, PERSON.saved, '@']) {
+    for (const secret of [
+      '972529998877',
+      '987654321098765',
+      '972541112233',
+      '123456789012345',
+      OWNER.name,
+      PERSON.saved,
+      '@',
+    ]) {
       expect(text).not.toContain(secret);
     }
     // The account is kept apart, for the scrubber only.
@@ -203,5 +213,49 @@ describe('live-check recorder', () => {
     expect(JSON.parse(manifest).proxy).toEqual({ used: true, protocol: 'socks5' });
     expect(manifest).not.toContain('127.0.0.1');
     expect(manifest).not.toContain('18461');
+  });
+
+  // The QR payload and the pairing code link a device to the account: whoever has one can pair it.
+  // The events tape redacted the QR; the webhook tape wrote qrcode.updated as Evolution sent it,
+  // code, image and pairing code included.
+  describe('a link in progress', () => {
+    const QR = '2@Q1R2S3T4U5V6W7X8Y9Z0qrsecret,keypart,otherpart,lastpart';
+    const PAIRING = 'WXYZ4321';
+
+    async function showQr(number?: string) {
+      process.env.LIVE_RECORD_DIR = root;
+      socketSpy.mockImplementationOnce((config: any) => ({
+        ...fakeSocket(config),
+        requestPairingCode: async () => PAIRING,
+      }));
+      const { service } = await makeService();
+      stubAuthState(service);
+      await service.connectToWhatsapp(number);
+      service.client.ev.emit('connection.update', { qr: QR });
+      await vi.waitFor(() => expect(emitted.some((e) => e.event === 'qrcode.updated')).toBe(true), { timeout: 5_000 });
+      const sentQr = emitted.find((e) => e.event === 'qrcode.updated').data.qrcode;
+      const dir = sessionDir();
+      const tapes = ['events.ndjson', 'webhooks.ndjson'].map((f) => readFileSync(join(dir, f), 'utf8')).join('\n');
+      return { sentQr, tapes };
+    }
+
+    it('never writes the QR payload or its image, in either tape', async () => {
+      const { sentQr, tapes } = await showQr();
+      // Evolution still sends them: only the recording leaves them out.
+      expect(sentQr.code).toBe(QR);
+      expect({ code: tapes.includes('qrsecret'), image: tapes.includes(sentQr.base64.slice(22, 80)) }).toEqual({
+        code: false,
+        image: false,
+      });
+    });
+
+    it('never writes the pairing code, in either tape', async () => {
+      const { sentQr, tapes } = await showQr('972541112233');
+      expect(sentQr.pairingCode).toBe(PAIRING);
+      expect({ pairingCode: tapes.includes(PAIRING), code: tapes.includes('qrsecret') }).toEqual({
+        pairingCode: false,
+        code: false,
+      });
+    });
   });
 });

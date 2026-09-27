@@ -6,6 +6,8 @@
 // the error's name, its message (scrubbed: no URL, JID or phone number) and
 // its status code when it has one. Two shapes are thrown in practice: a Boom
 // (an Error with output.statusCode) and a plain object that is not an Error.
+// reloadConnection (after a privacy or profile picture change) rebuilds the
+// socket the same way and printed the raw error, message and all.
 import { vi } from 'vitest';
 
 const { socketSpy } = vi.hoisted(() => ({ socketSpy: vi.fn() }));
@@ -97,5 +99,36 @@ describe('a failed reconnect says why', () => {
     ]);
     expect(plain).not.toContain(PHONE);
     expect(plain).not.toContain('Zq7secret');
+  });
+});
+
+describe('a failed reload says why, scrubbed', () => {
+  it('a Boom: its name, scrubbed message and status code, and nothing unscrubbed anywhere', async () => {
+    const { service } = await makeService();
+    service.defineAuthState = async () => {
+      throw new Boom(`request to ${URL_SECRET} for ${PHONE}@s.whatsapp.net failed, reason: getaddrinfo ENOTFOUND`, {
+        statusCode: 503,
+      });
+    };
+
+    let thrown: any;
+    const out = await captureOutput(async () => {
+      await service.reloadConnection().catch((e: any) => (thrown = e));
+    });
+
+    expect(thrown?.status).toBe(500);
+    const plain = out.replace(/\x1b\[[0-9;]*m/g, '');
+    expect(plain).not.toContain(PHONE);
+    expect(plain).not.toContain('Zq7secret');
+    const logged = plain
+      .split('\n')
+      .filter((l) => l.includes('Reload connection failed'))
+      .map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    expect(logged).toEqual([
+      {
+        message: 'Reload connection failed',
+        error: { name: 'Error', message: 'request to [url] for [jid] failed, reason: getaddrinfo ENOTFOUND', statusCode: 503 },
+      },
+    ]);
   });
 });

@@ -600,14 +600,6 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.info(`Browser: ${browser}`);
     }
 
-    const baileysVersion = await fetchLatestWaWebVersion({});
-    const version = baileysVersion.version;
-    const log = `Baileys version: ${version.join('.')}`;
-
-    this.logger.info(log);
-
-    this.logger.info(`Group Ignore: ${this.localSettings.groupsIgnore}`);
-
     let options;
 
     if (this.localProxy?.enabled) {
@@ -643,6 +635,18 @@ export class BaileysStartupService extends ChannelStartupService {
         this.mediaProxy = { key: this.proxyKey(), dispatcher: makeProxyAgentUndici(proxy) };
       }
     }
+
+    // The version request precedes every connect, so it leaves through the same exit as the socket.
+    const baileysVersion = await fetchLatestWaWebVersion(
+      options ? { httpsAgent: options.fetchAgent, proxy: false } : {},
+      options ? ({ dispatcher: this.mediaProxy.dispatcher } as RequestInit) : {},
+    );
+    const version = baileysVersion.version;
+    const log = `Baileys version: ${version.join('.')}`;
+
+    this.logger.info(log);
+
+    this.logger.info(`Group Ignore: ${this.localSettings.groupsIgnore}`);
 
     const socketConfig: UserFacingSocketConfig = {
       ...options,

@@ -2,8 +2,9 @@
 // default true). A consumer that only wants what is still on WhatsApp's
 // servers sends reupload: false: Evolution does not hand Baileys a
 // reuploadRequest, so the phone is never asked, and a file that has expired on
-// the CDN (404 or 410) fails at once, without Evolution's own 5s fallback, with
-// an error that says the file is gone and no re-upload was attempted.
+// the CDN (404 or 410, or 403 on a link whose `oe` has passed) fails at once,
+// without Evolution's own 5s fallback, with an error that says the file is gone
+// and no re-upload was attempted.
 // Omitting the field keeps today's behaviour: the phone is asked.
 import { vi } from 'vitest';
 
@@ -39,6 +40,11 @@ const PLAIN = Buffer.from('a photo, as the person sent it '.repeat(200));
 const LIVE = '/v/t62.7118-24/reuploaded.enc';
 const GONE = '/v/t62.7118-24/expired.enc';
 const GONE_403 = '/v/t62.7118-24/expired-403.enc';
+/** A media link's `oe` (when it stops working): hex unix seconds, as WhatsApp writes it. */
+const oe = (fromNowS: number) => (Math.floor(Date.now() / 1000) + fromNowS).toString(16).toUpperCase();
+const DAY = 24 * 60 * 60;
+const EXPIRED_LINK_403 = `${GONE_403}?ccb=11-4&oh=01_Q5Aa&oe=${oe(-DAY)}&_nc_sid=5e03e0`;
+const VALID_LINK_403 = `${GONE_403}?ccb=11-4&oh=01_Q5Aa&oe=${oe(14 * DAY)}&_nc_sid=5e03e0`;
 const GONE_MESSAGE =
   "The media is no longer on WhatsApp's servers (HTTP 404), and no re-upload from the phone was attempted (reupload: false)";
 
@@ -60,7 +66,7 @@ beforeAll(async () => {
   mediaKey = enc.mediaKey;
   const body = await readFile(enc.encFilePath);
   await rm(enc.encFilePath, { force: true });
-  cdn = await startCdn({ [LIVE]: body, [GONE_403]: 403 });
+  cdn = await startCdn({ [LIVE]: body, [EXPIRED_LINK_403]: 403, [VALID_LINK_403]: 403 });
   // Evolution waits 5s before its own fallback download; shortened, so a test that
   // takes it is not slow, and one that skips it is told apart by what it answers.
   const realSetTimeout = globalThis.setTimeout;
@@ -126,16 +132,31 @@ describe('a media download can skip asking the phone to re-upload', () => {
     });
   });
 
-  it('reupload: false and a CDN 403 (an expired file too): the phone is not asked, and the error says the file is gone', async () => {
+  it('reupload: false and a CDN 403 on a link whose oe has passed: the phone is not asked, and the error says the file is gone', async () => {
     const message = expiredImage();
-    message.message.imageMessage.url = `http://127.0.0.1:${cdn.port}${GONE_403}`;
+    message.message.imageMessage.url = `http://127.0.0.1:${cdn.port}${EXPIRED_LINK_403}`;
     const answer = await post({ message, reupload: false });
 
     expect(asked).toEqual([]);
-    expect(cdn.log).toEqual([`GET ${GONE_403}`]);
+    expect(cdn.log).toEqual([`GET ${EXPIRED_LINK_403}`]);
     expect(answer).toEqual({
       status: 400,
       body: { status: 400, error: 'Bad Request', response: { message: [GONE_MESSAGE.replace('HTTP 404', 'HTTP 403')], reupload: 'not_requested' } },
+    });
+  });
+
+  it('reupload: false and a CDN 403 on a link whose oe has not passed: not reported as a file that is gone', async () => {
+    const message = expiredImage();
+    message.message.imageMessage.url = `http://127.0.0.1:${cdn.port}${VALID_LINK_403}`;
+    const answer = await post({ message, reupload: false });
+
+    expect(asked).toEqual([]);
+    // The first GET is the download; Evolution's own fallback then tries mmg.whatsapp.net, refused here.
+    expect(cdn.log).toEqual([`GET ${VALID_LINK_403}`]);
+    // Its answer is that fallback's own failure, not the "no longer on WhatsApp's servers" 400.
+    expect(answer).toEqual({
+      status: 400,
+      body: { status: 400, error: 'Bad Request', response: { message: ['TypeError: fetch failed'], reupload: 'not_requested' } },
     });
   });
 

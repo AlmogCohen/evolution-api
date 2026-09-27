@@ -9,6 +9,12 @@
 // HTTP status only in `output.statusCode` (lib/Utils/messages-media.js:304), so
 // that check never matches and rc14 never asks. Evolution asks itself when
 // Baileys did not.
+//
+// A 403 asks the phone only when the media link itself has expired: its `oe`
+// query parameter (hex unix seconds, read from the url, else the directPath)
+// has passed. Measured on WhatsApp's media CDN (2026-09-27, 84 history-sync
+// attachments): 403 on 34 of 34 links whose `oe` had passed, on 0 of 50 valid
+// ones, and a valid link to a file the CDN dropped answered 404 or 410.
 import { vi } from 'vitest';
 
 vi.mock('@api/server.module', () => import('../helpers/fake-server-module'));
@@ -22,7 +28,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { makeService } from '../helpers/baileys-service';
 import { captureOutput } from '../helpers/capture-output';
-import { type Listening, startCdn } from '../helpers/local-net';
+import { type Listening, startCdn, startHttpsServer, trustTestCertificate } from '../helpers/local-net';
 
 const PHONE = '972509876543';
 const CAPTION = 'Zq7 a private caption Zq7';
@@ -33,10 +39,16 @@ const GONE = '/v/t62.7118-24/expired.enc';
 const GONE_AGAIN = '/v/t62.7118-24/expired-again.enc';
 const GONE_410 = '/v/t62.7118-24/expired-410.enc';
 const GONE_403 = '/v/t62.7118-24/expired-403.enc';
+/** A media link's `oe` (when it stops working): hex unix seconds, as WhatsApp writes it. */
+const oe = (fromNowS: number) => (Math.floor(Date.now() / 1000) + fromNowS).toString(16).toUpperCase();
+const DAY = 24 * 60 * 60;
+const EXPIRED_LINK_403 = `${GONE_403}?ccb=11-4&oh=01_Q5Aa&oe=${oe(-DAY)}&_nc_sid=5e03e0`;
+const VALID_LINK_403 = `${GONE_403}?ccb=11-4&oh=01_Q5Aa&oe=${oe(14 * DAY)}&_nc_sid=5e03e0`;
 const BROKEN = '/v/t62.7118-24/broken.enc';
 
 let cdn: Listening;
 let mediaKey: Uint8Array;
+let liveBody: Buffer;
 
 // Refuse any connection that is not to 127.0.0.1: Evolution's own fallback
 // retries the download at mmg.whatsapp.net, which must fail here, not leave.
@@ -50,8 +62,16 @@ beforeAll(async () => {
   const enc = await encryptedStream(PLAIN, 'image', {});
   mediaKey = enc.mediaKey;
   const body = await readFile(enc.encFilePath);
+  liveBody = body;
   await rm(enc.encFilePath, { force: true });
-  cdn = await startCdn({ [LIVE]: body, [GONE_410]: 410, [GONE_403]: 403, [BROKEN]: 500 });
+  cdn = await startCdn({
+    [LIVE]: body,
+    [GONE_410]: 410,
+    [GONE_403]: 403,
+    [EXPIRED_LINK_403]: 403,
+    [VALID_LINK_403]: 403,
+    [BROKEN]: 500,
+  });
   // Evolution waits 5s before its own fallback download, and gives the phone a
   // bounded time to answer a re-upload request; both are shortened here.
   const realSetTimeout = globalThis.setTimeout;
@@ -176,17 +196,68 @@ describe('an expired media download asks the phone to re-upload, once', () => {
     expect(lines).toEqual([line('outcome=reupload_requested'), line('outcome=reupload_ok')]);
   });
 
-  // Empirical (2026-09-27): media from a history sync, 30 to 180 days old, answered
-  // 403 on a real linked phone where 24-day-old media answered 410.
-  it('a CDN 403 asks the phone too', async () => {
+  it('a CDN 403 on a link whose oe has passed asks the phone', async () => {
     const { service, asked } = await serviceWithPhone('reuploads');
-    const { result, thrown, lines } = await download(service, GONE_403);
+    const { result, thrown, lines } = await download(service, EXPIRED_LINK_403);
 
     expect(thrown).toBeUndefined();
     expect(Buffer.from(result.base64, 'base64').equals(PLAIN)).toBe(true);
     expect(asked).toEqual([ID]);
-    expect(cdn.log).toEqual([`GET ${GONE_403}`, `GET ${LIVE}`]);
+    expect(cdn.log).toEqual([`GET ${EXPIRED_LINK_403}`, `GET ${LIVE}`]);
     expect(lines).toEqual([line('outcome=reupload_requested'), line('outcome=reupload_ok')]);
+  });
+
+  it('a CDN 403 on a link whose oe has not passed does not ask the phone', async () => {
+    const { service, asked } = await serviceWithPhone('reuploads');
+    const { thrown, out, lines } = await download(service, VALID_LINK_403);
+
+    expect(asked).toEqual([]);
+    expect(cdn.log).toEqual([`GET ${VALID_LINK_403}`]);
+    expect(thrown).toEqual(badRequest('not_requested'));
+    expect(lines).toEqual([line('outcome=download_failed, status=403, reupload=not_requested')]);
+    expectNothingPrivate(out);
+  });
+
+  it('a CDN 403 on a link with no oe does not ask the phone', async () => {
+    const { service, asked } = await serviceWithPhone('reuploads');
+    const { thrown, out, lines } = await download(service, GONE_403);
+
+    expect(asked).toEqual([]);
+    expect(cdn.log).toEqual([`GET ${GONE_403}`]);
+    expect(thrown).toEqual(badRequest('not_requested'));
+    expect(lines).toEqual([line('outcome=download_failed, status=403, reupload=not_requested')]);
+    expectNothingPrivate(out);
+  });
+
+  it('a CDN 403 whose url has no oe reads it from the directPath', async () => {
+    // A directPath is fetched over https from the url's host, so this CDN is https.
+    const untrust = trustTestCertificate();
+    const tlsCdn = await startHttpsServer((req, _body, res) => {
+      if (req.url === LIVE) return void res.writeHead(200, { 'content-length': liveBody.length }).end(liveBody);
+      res.writeHead(403).end();
+    });
+    try {
+      const { service } = await makeService();
+      const asked: string[] = [];
+      service.client.updateMediaMessage = async (message: any) => {
+        asked.push(message.key.id);
+        message.message.imageMessage.directPath = LIVE;
+        return message;
+      };
+      const directPath = `${GONE_403}?ccb=11-4&oh=01_Q5Aa&oe=${oe(-DAY)}&_nc_sid=5e03e0`;
+      const message = expiredImage();
+      message.message.imageMessage.url = `https://127.0.0.1:${tlsCdn.port}${GONE_403}`;
+      (message.message.imageMessage as any).directPath = directPath;
+
+      const result = await service.getBase64FromMediaMessage({ message });
+
+      expect(Buffer.from(result.base64, 'base64').equals(PLAIN)).toBe(true);
+      expect(asked).toEqual([ID]);
+      expect(tlsCdn.log).toEqual([`GET ${directPath}`, `GET ${LIVE}`]);
+    } finally {
+      await tlsCdn.close();
+      untrust();
+    }
   });
 
   it('a re-uploaded copy that is gone as well is not re-uploaded again', async () => {

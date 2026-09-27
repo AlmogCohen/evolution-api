@@ -253,8 +253,12 @@ const reuploadRefusal = (error: any): string => {
   return 'unknown';
 };
 
-/** A CDN answer that means the file has expired there, and only the phone still has it. */
-const isExpiredMedia = (error: any) => [404, 410].includes(httpStatus(error));
+/**
+ * A CDN answer that means the file has expired there, and only the phone still has it.
+ * 403 is empirical: history-sync media 30 to 180 days old answered 403 on a real linked
+ * phone (2026-09-27), where 24-day-old media answered 410.
+ */
+const isExpiredMedia = (error: any) => [403, 404, 410].includes(httpStatus(error));
 
 /**
  * How long the phone gets to answer a re-upload request. Baileys' updateMediaMessage
@@ -4573,7 +4577,7 @@ export class BaileysStartupService extends ChannelStartupService {
       } catch (error) {
         const status = httpStatus(error);
         this.logger.error(`media download: ${media}, outcome=download_failed, status=${status}, reupload=${reupload}`);
-        if (!askPhone && (status === 404 || status === 410)) {
+        if (!askPhone && isExpiredMedia(error)) {
           throw `The media is no longer on WhatsApp's servers (HTTP ${status}), and no re-upload from the phone was attempted (reupload: false)`;
         }
         this.logger.error('Download Media failed, trying to retry in 5 seconds...');

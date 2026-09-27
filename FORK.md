@@ -35,8 +35,32 @@ A fix without a failing test first is not merged here. See `AGENTS.md`.
 
 ## Changes from 2.3.7
 
-The list grows with each red and green pair. `git log 2.3.7..` is the source of
-truth, and `git diff 2.3.7 --stat` lists every file modified from the original.
+Each line is a pair of commits: the test that failed on 2.3.7, then the fix.
+`git log 2.3.7..` is the source of truth, and `git diff 2.3.7 --stat` lists
+every file modified from the original. Upstream issues and pull requests are
+named where one exists.
+
+**Contacts, names and groups**
+- App-state sync keys are reloaded with `fromObject` in all three auth stores, so saved names, labels, mutes and archives keep syncing after a restart (#2576, #2384; fixes also offered in #2685 and #2610).
+- Every @lid to phone mapping Baileys learns is forwarded on `contacts.upsert`, captured before Baileys' event buffer drops it.
+- Every `contacts.upsert` item says whether its name is the one the owner saved (`saved`), and only when that is certain.
+- Group updates reach subscriptions stored as `GROUP_UPDATE`, in all seven transports and in the global configurations (#2652).
+- Group metadata is filled from `groups.update` instead of queried again for every group on every listing.
+
+**Messages and privacy**
+- A `getMessage` miss answers nothing, so Baileys no longer relays an empty message on a retry (#2705, #2550).
+- No message text, phone number, JID or push name reaches the logs at `LOG_LEVEL=ERROR,WARN`, including Baileys' own error logs.
+
+**Proxy**
+- Media downloads, media uploads and the WhatsApp Web version fetch leave through the instance's proxy (uploads failed outright on a proxied instance).
+- A connect waits for the instance's proxy and stored settings, so it never starts from the server's own address or with default settings.
+
+**Sessions and connections**
+- A database error never replaces a linked session's credentials with fresh ones, and a failed settings read no longer drops an event batch.
+- A logout or delete while the socket is down keeps the session until WhatsApp is told, so the device leaves the phone's Linked devices; it answers `202 PENDING` meanwhile and forwards nothing (#2520, #2508 in part).
+- Reconnects back off from 1s to 60s instead of spinning, the version fetch times out after 10s, and an instance never runs two sockets (#2134, #2184, #2430; ideas from #2732).
+- Profile pictures are looked up once per contact per hour, at most four at a time, and history never waits on them (#1883).
+- One pairing code per connect attempt, and a fresh QR budget per attempt (#2100, #2696).
 
 ## Licence
 

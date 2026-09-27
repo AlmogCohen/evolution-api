@@ -82,6 +82,7 @@ import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
+import { jidKind, makeBaileysLogger } from '@utils/log-privacy';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { status } from '@utils/renderStatus';
@@ -146,7 +147,6 @@ import NodeCache from 'node-cache';
 import cron from 'node-cron';
 import { release } from 'os';
 import { join } from 'path';
-import P from 'pino';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import sharp from 'sharp';
@@ -645,11 +645,11 @@ export class BaileysStartupService extends ChannelStartupService {
     const socketConfig: UserFacingSocketConfig = {
       ...options,
       version,
-      logger: P({ level: this.logBaileys }),
+      logger: makeBaileysLogger(this.logBaileys),
       printQRInTerminal: false,
       auth: {
         creds: this.instance.authState.state.creds,
-        keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'error' }) as any),
+        keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, makeBaileysLogger('error') as any),
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
       generateHighQualityLinkPreview: true,
@@ -711,13 +711,13 @@ export class BaileysStartupService extends ChannelStartupService {
     this.eventHandler();
 
     this.client.ws.on('CB:call', (packet) => {
-      console.log('CB:call', packet);
+      this.logger.verbose(`CB:call id=${packet?.attrs?.id ?? ''}`);
       const payload = { event: 'CB:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
 
     this.client.ws.on('CB:ack,class:call', (packet) => {
-      console.log('CB:ack,class:call', packet);
+      this.logger.verbose(`CB:ack,class:call id=${packet?.attrs?.id ?? ''}`);
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
     });
@@ -1009,7 +1009,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          console.log('received on-demand history sync, messages=', messages);
+          this.logger.info(`received on-demand history sync, messages=${messages.length}`);
         }
         console.log(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
@@ -1156,21 +1156,20 @@ export class BaileysStartupService extends ChannelStartupService {
     ) => {
       try {
         for (const received of messages) {
-          if (
-            received?.messageStubParameters?.some?.((param) =>
-              [
-                'No matching sessions found for message',
-                'Bad MAC',
-                'failed to decrypt message',
-                'SessionError',
-                'Invalid PreKey ID',
-                'No session record',
-                'No session found to decrypt message',
-                'Message absent from node',
-              ].some((err) => param?.includes?.(err)),
-            )
-          ) {
-            this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
+          const decryptFailure = [
+            'No matching sessions found for message',
+            'Bad MAC',
+            'failed to decrypt message',
+            'SessionError',
+            'Invalid PreKey ID',
+            'No session record',
+            'No session found to decrypt message',
+            'Message absent from node',
+          ].find((err) => received?.messageStubParameters?.some?.((param) => param?.includes?.(err)));
+          if (decryptFailure) {
+            this.logger.warn(
+              `Message ignored with messageStubParameters: id=${received.key?.id}, chat=${jidKind(received.key?.remoteJid)}, reason=${decryptFailure}`,
+            );
             continue;
           }
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
@@ -1181,7 +1180,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
               console.log('requested placeholder resync, id=', messageId);
             } else if (requestId) {
-              console.log('Message received from phone, id=', requestId, received);
+              this.logger.info(`Message received from phone, id=${requestId}, message id=${received.key?.id}`);
             }
 
             if (text == 'onDemandHistSync') {
@@ -1267,7 +1266,9 @@ export class BaileysStartupService extends ChannelStartupService {
                   data: { name: received.pushName },
                 });
               } catch {
-                console.log(`Chat insert record ignored: ${received.key.remoteJid} - ${this.instanceId}`);
+                this.logger.warn(
+                  `Chat insert record ignored: ${jidKind(received.key.remoteJid)} chat - ${this.instanceId}`,
+                );
               }
             }
           }
@@ -1519,7 +1520,7 @@ export class BaileysStartupService extends ChannelStartupService {
                   { key: received.key, message: received?.message },
                   'buffer',
                   {},
-                  { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                  { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
                 );
 
                 if (buffer) {
@@ -1530,7 +1531,7 @@ export class BaileysStartupService extends ChannelStartupService {
                     { key: received.key, message: received?.message },
                     'buffer',
                     {},
-                    { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                    { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
                   );
 
                   if (buffer) {
@@ -1549,8 +1550,6 @@ export class BaileysStartupService extends ChannelStartupService {
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
           }
-          console.log(messageRaw);
-
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
           await chatbotController.emit({
@@ -1642,7 +1641,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const cached = await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
-        console.log('CACHE:', { cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
+        this.logger.verbose({ cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
 
         if (
           (update.messageTimestamp && update.messageTimestamp === cached) ||
@@ -1718,7 +1717,7 @@ export class BaileysStartupService extends ChannelStartupService {
             findMessage = messages[0] || null;
 
             if (!findMessage?.id) {
-              this.logger.warn(`Original message not found for update. Skipping. Key: ${JSON.stringify(key)}`);
+              this.logger.warn(`Original message not found for update. Skipping. Message id: ${key.id}`);
               continue;
             }
             message.messageId = findMessage.id;
@@ -1791,7 +1790,9 @@ export class BaileysStartupService extends ChannelStartupService {
               try {
                 await this.prismaRepository.chat.update({ where: { id: existingChat.id }, data: chatToInsert });
               } catch {
-                console.log(`Chat insert record ignored: ${chatToInsert.remoteJid} - ${chatToInsert.instanceId}`);
+                this.logger.warn(
+                  `Chat insert record ignored: ${jidKind(chatToInsert.remoteJid)} chat - ${chatToInsert.instanceId}`,
+                );
               }
             }
           }
@@ -1872,7 +1873,7 @@ export class BaileysStartupService extends ChannelStartupService {
         this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, enhancedParticipantsUpdate);
       } catch (error) {
         this.logger.error(
-          `Failed to resolve participant data for GROUP_PARTICIPANTS_UPDATE webhook: ${error.message} | Group: ${participantsUpdate.id} | Participants: ${participantsUpdate.participants.length}`,
+          `Failed to resolve participant data for GROUP_PARTICIPANTS_UPDATE webhook: ${error.message} | Participants: ${participantsUpdate.participants.length}`,
         );
         // Fallback - envia sem conversão
         this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, participantsUpdate);
@@ -2594,7 +2595,7 @@ export class BaileysStartupService extends ChannelStartupService {
               { key: messageRaw.key, message: messageRaw?.message },
               'buffer',
               {},
-              { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+              { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
             );
 
             if (buffer) {
@@ -2605,7 +2606,7 @@ export class BaileysStartupService extends ChannelStartupService {
                 { key: messageRaw.key, message: messageRaw?.message },
                 'buffer',
                 {},
-                { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
               );
 
               if (buffer) {
@@ -3978,7 +3979,7 @@ export class BaileysStartupService extends ChannelStartupService {
           { key: msg?.key, message: msg?.message },
           'buffer',
           {},
-          { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+          { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
         );
       } catch {
         this.logger.error('Download Media failed, trying to retry in 5 seconds...');
@@ -4387,7 +4388,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
       if (await groupMetadataCache?.has(groupJid)) {
-        console.log(`Cache request for group: ${groupJid}`);
+        this.logger.verbose('Cache request for group: found');
         const meta = await groupMetadataCache.get(groupJid);
 
         if (Date.now() - meta.timestamp > 3600000) {
@@ -4397,7 +4398,7 @@ export class BaileysStartupService extends ChannelStartupService {
         return meta.data;
       }
 
-      console.log(`Cache request for group: ${groupJid} - not found`);
+      this.logger.verbose('Cache request for group: not found');
       return await this.updateGroupMetadataCache(groupJid);
     }
 
@@ -4938,7 +4939,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async baileysSendNode(stanza: any) {
-    console.log('stanza', JSON.stringify(stanza));
+    this.logger.verbose(`stanza ${stanza?.tag ?? ''}`);
     const response = await this.client.sendNode(stanza);
 
     return response;

@@ -27,6 +27,7 @@ export function fakeSocket(config?: any) {
   };
   let closed = false;
   let open = false;
+  const onClose: (() => void)[] = [];
   ev.on('connection.update', (update: any) => {
     if (update.connection === 'close') closed = true;
     if (update.connection === 'open') open = true;
@@ -39,14 +40,30 @@ export function fakeSocket(config?: any) {
     profilePictureUrl: async () => undefined,
     /** How many times the socket told WhatsApp to remove this device (remove-companion-device). */
     logouts: 0,
-    // As Baileys' logout(): with a linked device it first tells WhatsApp, which throws when the ws is
-    // not open (sendNode: 'Connection Closed'); then it ends the socket with loggedOut.
+    /** Whether WhatsApp answers the remove-companion-device IQ (with type result). */
+    confirmRemove: true,
+    /** Called once a remove-companion-device has been written, e.g. to drop the connection then. */
+    afterRemove: undefined as undefined | (() => void),
+    // As Baileys' logout(): with a linked device it first writes remove-companion-device (sendNode,
+    // which throws when the ws is not open: 'Connection Closed') without waiting for any answer; then
+    // it ends the socket itself, locally, with loggedOut.
     logout: async (msg?: string) => {
       if (config?.auth?.creds?.me?.id) {
         if (!open || closed) throw new Boom('Connection Closed', { statusCode: 428 });
         sock.logouts++;
+        sock.afterRemove?.();
       }
       sock.end(new Boom(msg || 'Intentional Logout', { statusCode: 401 }));
+    },
+    // As Baileys' query(): write the node, then wait for WhatsApp's answer; the wait fails when the
+    // socket closes first. Only remove-companion-device is modelled.
+    query: async (node: any) => {
+      if (node?.content?.[0]?.tag !== 'remove-companion-device') throw new Error('fake socket: query not modelled');
+      if (!open || closed) throw new Boom('Connection Closed', { statusCode: 428 });
+      sock.logouts++;
+      sock.afterRemove?.();
+      if (sock.confirmRemove) return { tag: 'iq', attrs: { type: 'result', id: node.attrs.id } };
+      return new Promise((_, reject) => onClose.push(() => reject(new Boom('Connection Closed', { statusCode: 428 }))));
     },
     /** Whether Evolution called end() on this socket. */
     ended: false,
@@ -57,6 +74,7 @@ export function fakeSocket(config?: any) {
       if (closed) return;
       closed = true;
       ev.emit('connection.update', { connection: 'close', lastDisconnect: { error, date: new Date() } });
+      onClose.splice(0).forEach((f) => f());
     },
   };
   return sock;
@@ -74,7 +92,10 @@ export function stubAuthState(service: any) {
 export type ProxyProtocol = 'http' | 'socks5';
 
 /** Set the proxy the way /proxy/set does, then connect the way Evolution does. Returns the socket config. */
-export async function connectBehind(socketSpy: { mock: { calls: any[][] } }, proxy?: { protocol: ProxyProtocol; port: number }) {
+export async function connectBehind(
+  socketSpy: { mock: { calls: any[][] } },
+  proxy?: { protocol: ProxyProtocol; port: number },
+) {
   const { service } = await makeService();
   if (proxy) {
     await service.setProxy({

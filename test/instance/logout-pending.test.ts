@@ -593,4 +593,29 @@ describe('a logout that cannot reach WhatsApp', () => {
     await settle(service);
     expect({ logouts: sock.logouts, me: storedMe() }).toEqual({ logouts: 1, me: [] });
   });
+
+  // Baileys' logout() writes remove-companion-device and then ends the socket itself with loggedOut;
+  // it never waits for WhatsApp. So that close is not WhatsApp's word: if the connection fails before
+  // WhatsApp processed the request, the device stays linked, and wiping the creds leaves it on the
+  // phone for good.
+  it('is not finished by the socket closing itself: without WhatsApp confirming, it stays pending', async () => {
+    await linkedInstance();
+    const monitor = await startProcess();
+    await vi.waitFor(() => expect(built()).toHaveLength(1));
+    const service = monitor.waInstances.test;
+    const sock = current();
+    await opened(sock);
+    // The request is written, then the connection fails before WhatsApp answers.
+    sock.confirmRemove = false;
+    sock.afterRemove = () => setTimeout(() => sock.end(new Boom('Connection Terminated', { statusCode: 428 })), 20);
+
+    expect(await call('DELETE', 'logout')).toEqual(PENDING);
+    expect({ me: storedMe(), pending: service.logoutPending }).toEqual({ me: [WUID], pending: true });
+
+    // The reconnect: WhatsApp refuses the device, which is its word that it is gone.
+    const next = await reconnected(2);
+    next.end(new Boom('Connection Failure', { statusCode: 401 }));
+    await settle(service);
+    expect({ me: storedMe(), pending: service.logoutPending }).toEqual({ me: [], pending: false });
+  });
 });

@@ -561,4 +561,36 @@ describe('a logout that cannot reach WhatsApp', () => {
       marker: false,
     });
   });
+
+  // Two logouts at once (two clients, or a logout and a delete): the second answered 'done' as
+  // soon as it saw the first under way, while the first's remove-companion-device was still in
+  // flight and could still fail and leave the logout pending.
+  it('a second logout while the first is under way answers with the first, not before it', async () => {
+    await linkedInstance();
+    const monitor = await startProcess();
+    await vi.waitFor(() => expect(built()).toHaveLength(1));
+    const service = monitor.waInstances.test;
+    const sock = current();
+    await opened(sock);
+    let release: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const logout = sock.logout;
+    sock.logout = async (msg?: string) => {
+      await gate;
+      return logout(msg);
+    };
+
+    const answered: string[] = [];
+    const first = call('DELETE', 'logout').then((r) => (answered.push('first'), r));
+    await new Promise((r) => setTimeout(r, 50));
+    const second = call('DELETE', 'logout').then((r) => (answered.push('second'), r));
+    await new Promise((r) => setTimeout(r, 200));
+    expect(answered).toEqual([]);
+
+    release();
+    const ok = { status: 200, body: { status: 'SUCCESS', error: false, response: { message: 'Instance logged out' } } };
+    expect({ first: await first, second: await second }).toEqual({ first: ok, second: ok });
+    await settle(service);
+    expect({ logouts: sock.logouts, me: storedMe() }).toEqual({ logouts: 1, me: [] });
+  });
 });

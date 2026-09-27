@@ -231,6 +231,20 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+/**
+ * A media key as bytes. A message that arrives over HTTP JSON carries it as a base64
+ * string, the index-keyed object JSON makes of a Uint8Array, or the {type:'Buffer', data}
+ * it makes of a Buffer. Baileys' download reads a base64 string itself, but its re-upload
+ * (updateMediaMessage: encryptMediaRetryRequest, decryptMediaRetryData) derives the retry
+ * key from the value as given, and then cannot decrypt the phone's answer.
+ */
+const mediaKeyBytes = (value: any): Buffer => {
+  if (typeof value === 'string') return Buffer.from(value.replace('data:;base64,', ''), 'base64');
+  if (value instanceof Uint8Array) return Buffer.from(value);
+  if (value?.type === 'Buffer' && Array.isArray(value.data)) return Buffer.from(value.data);
+  return Buffer.from(Object.values(value) as number[]);
+};
+
 /** Whether a media download asked the phone to re-upload an expired file, and how that ended. */
 type MediaReupload = 'not_requested' | 'ok' | 'failed';
 
@@ -4515,8 +4529,8 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
-      if (typeof mediaMessage['mediaKey'] === 'object') {
-        msg.message[mediaType].mediaKey = Uint8Array.from(Object.values(mediaMessage['mediaKey']));
+      if (mediaMessage['mediaKey'] != null) {
+        msg.message[mediaType].mediaKey = mediaKeyBytes(mediaMessage['mediaKey']);
       }
 
       let buffer: Buffer;

@@ -58,6 +58,9 @@
     ],
     "src/**/*.ts": [
       "sh -c 'tsc --noEmit'"
+    ],
+    "test/fixtures/live/**": [
+      "tsx scripts/live-guard.ts"
     ]
   },
   "config": {

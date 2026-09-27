@@ -259,6 +259,17 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
 
+  // Profile pictures seen by the event handlers: one IQ per jid per hour, a few
+  // in flight at once. Every contacts.upsert, contacts.update and inbound message
+  // used to ask WhatsApp again, which at link time is thousands of IQs in a
+  // burst. WhatsApp's picture notification (contacts.update imgUrl) refreshes it.
+  private readonly PICTURE_TTL_MS = 60 * 60 * 1000;
+  private readonly PICTURE_MAX_IN_FLIGHT = 4;
+  private readonly pictureCache = new Map<string, { url: string | null; at: number }>();
+  private readonly pictureLookups = new Map<string, Promise<string | null>>();
+  private pictureSlots = 0;
+  private readonly pictureWaiters: (() => void)[] = [];
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
@@ -269,6 +280,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async logoutInstance() {
     this.messageProcessor.onDestroy();
+    this.pictureCache.clear();
 
     // Baileys' logout tells WhatsApp to remove this device and then ends the socket.
     // With the socket down the first step throws ('Connection Closed') and the socket
@@ -894,7 +906,7 @@ export class BaileysStartupService extends ChannelStartupService {
           contacts.map(async (contact) => ({
             remoteJid: contact.id,
             pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
-            profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+            profilePicUrl: (await this.cachedProfilePicture(contact.id)).profilePictureUrl,
             instanceId: this.instanceId,
           })),
         );
@@ -945,10 +957,13 @@ export class BaileysStartupService extends ChannelStartupService {
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
+        // imgUrl is set only by WhatsApp's picture notification: 'changed' or 'removed'.
+        if (contact.imgUrl === 'removed') this.pictureCache.set(createJid(contact.id), { url: null, at: Date.now() });
         contactsRaw.push({
           remoteJid: contact.id,
           pushName: contact?.name ?? contact?.verifiedName,
-          profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+          profilePicUrl: (await this.cachedProfilePicture(contact.id, { fresh: contact.imgUrl === 'changed' }))
+            .profilePictureUrl,
           instanceId: this.instanceId,
         });
       }
@@ -1600,7 +1615,7 @@ export class BaileysStartupService extends ChannelStartupService {
           } = {
             remoteJid: received.key.remoteJid,
             pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
+            profilePicUrl: (await this.cachedProfilePicture(received.key.remoteJid)).profilePictureUrl,
             instanceId: this.instanceId,
           };
 
@@ -2155,15 +2170,54 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
+  /** Asks WhatsApp now (an explicit request), and keeps the answer for the event handlers. */
   public async profilePicture(number: string) {
     const jid = createJid(number);
+    let profilePictureUrl: string | null;
 
     try {
-      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image');
-
-      return { wuid: jid, profilePictureUrl };
+      profilePictureUrl = await this.client.profilePictureUrl(jid, 'image');
     } catch {
-      return { wuid: jid, profilePictureUrl: null };
+      profilePictureUrl = null;
+    }
+
+    this.pictureCache.set(jid, { url: profilePictureUrl, at: Date.now() });
+    return { wuid: jid, profilePictureUrl };
+  }
+
+  /** The picture the event handlers report: kept for PICTURE_TTL_MS, one lookup per jid at a time. */
+  private async cachedProfilePicture(number: string, opts: { fresh?: boolean } = {}) {
+    const jid = createJid(number);
+    const kept = this.pictureCache.get(jid);
+
+    if (!opts.fresh && kept && Date.now() - kept.at < this.PICTURE_TTL_MS) {
+      return { wuid: jid, profilePictureUrl: kept.url };
+    }
+
+    let lookup = opts.fresh ? undefined : this.pictureLookups.get(jid);
+    if (!lookup) {
+      const started = this.withPictureSlot(() => this.profilePicture(jid))
+        .then((r) => r.profilePictureUrl)
+        .finally(() => {
+          if (this.pictureLookups.get(jid) === started) this.pictureLookups.delete(jid);
+        });
+      this.pictureLookups.set(jid, started);
+      lookup = started;
+    }
+
+    return { wuid: jid, profilePictureUrl: await lookup };
+  }
+
+  private async withPictureSlot<T>(fn: () => Promise<T>): Promise<T> {
+    while (this.pictureSlots >= this.PICTURE_MAX_IN_FLIGHT) {
+      await new Promise<void>((resolve) => this.pictureWaiters.push(resolve));
+    }
+    this.pictureSlots++;
+    try {
+      return await fn();
+    } finally {
+      this.pictureSlots--;
+      this.pictureWaiters.shift()?.();
     }
   }
 
@@ -4594,7 +4648,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     let groups = [];
     for (const group of fetch) {
-      const picture = await this.profilePicture(group.id);
+      const picture = await this.cachedProfilePicture(group.id);
 
       const result = {
         id: group.id,

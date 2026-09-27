@@ -63,8 +63,15 @@ describe('a re-upload the phone does not answer in time', () => {
     const waitForMediaUpdate = bindWaitForEvent(ev, 'messages.media-update');
     const lateUpdates: any[] = [];
     service.client.updateMediaMessage = async (message: any) => {
-      // As Baileys: write the request (nothing to write here), then wait for the answer, untimed.
-      await waitForMediaUpdate(async (update: any[]) => !!update.find((u) => u.key.id === message.key.id));
+      // As Baileys: write the request (nothing to write here), then wait for the answer, untimed; an
+      // answer carrying an error is thrown.
+      let error: any;
+      await waitForMediaUpdate(async (update: any[]) => {
+        const result = update.find((u) => u.key.id === message.key.id);
+        if (result?.error) error = result.error;
+        return !!result;
+      });
+      if (error) throw error;
       lateUpdates.push(message.key.id);
       ev.emit('messages.update', [{ key: message.key, update: { message: message.message } }]);
       return message;

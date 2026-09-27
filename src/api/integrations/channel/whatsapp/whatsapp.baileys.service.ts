@@ -4738,6 +4738,24 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   /**
+   * End Baileys' wait for the phone's answer to a re-upload request (updateMediaMessage waits on
+   * messages.media-update with no timeout): answer it with an error for that message, on the socket
+   * that asked. Marked as Evolution's own event for a live recording.
+   */
+  private abandonReupload(client: WASocket, key: WAMessageKey) {
+    const emit = () =>
+      client?.ev?.emit('messages.media-update', [
+        { key, error: new Boom('Media re-upload abandoned: no answer in time', { statusCode: 408 }) },
+      ]);
+    try {
+      if (this.liveRecorder) this.liveRecorder.fromApp(emit);
+      else emit();
+    } catch (error) {
+      this.logger.warn({ message: 'Could not end the re-upload wait', error: errorFields(error) });
+    }
+  }
+
+  /**
    * The key the phone stores a message under, which is how a request about the message
    * (a media re-upload) must name it: the phone refuses one that names a DM it keeps
    * under an @lid by the phone JID. The messages.upsert webhook shows such a DM under
@@ -4850,6 +4868,9 @@ export class BaileysStartupService extends ChannelStartupService {
             reject(Object.assign(error, { name: 'ReuploadTimeoutError' }));
           }, MEDIA_REUPLOAD_TIMEOUT_MS);
         });
+        const client = this.client;
+        let abandoned = false;
+        let asking: Promise<WAMessage>;
         try {
           // The key's original form first; when the key cannot say which address the phone keeps the
           // message under (the phone with its @lid beside it), the key as given if the phone refuses.
@@ -4858,8 +4879,9 @@ export class BaileysStartupService extends ChannelStartupService {
             const candidates = [original];
             if (JSON.stringify(original) !== JSON.stringify(message.key)) candidates.push(message.key);
             for (const [i, key] of candidates.entries()) {
+              if (abandoned) throw new Error('re-upload abandoned');
               try {
-                return await this.client.updateMediaMessage({ ...message, key });
+                return await client.updateMediaMessage({ ...message, key });
               } catch (error) {
                 const refused = typeof error?.data?.result === 'number';
                 if (!refused || i === candidates.length - 1) throw error;
@@ -4869,11 +4891,19 @@ export class BaileysStartupService extends ChannelStartupService {
               }
             }
           };
-          const updated = await Promise.race([ask(), timeout]);
+          asking = ask();
+          const updated = await Promise.race([asking, timeout]);
           reupload = 'ok';
           this.logger.warn(`media download: ${media}, outcome=reupload_ok`);
           return updated;
         } catch (error) {
+          if (error?.name === 'ReuploadTimeoutError') {
+            // Baileys waits for the answer with no timeout of its own (bindWaitForEvent): end that
+            // wait, so its listeners go and an answer arriving later changes nothing.
+            abandoned = true;
+            asking?.catch(() => undefined);
+            this.abandonReupload(client, message.key);
+          }
           reupload = 'failed';
           reuploadReason = reuploadRefusal(error);
           this.logger.warn(

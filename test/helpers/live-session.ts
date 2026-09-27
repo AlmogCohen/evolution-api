@@ -1,10 +1,14 @@
 // A short synthetic live session, played on the socket Evolution's real connect
 // built (the test file mocks makeWASocket with fakeSocket). The identities look
 // real on purpose: the recorder must keep them, and the scrubber must replace them.
+import { readdirSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { proto } from 'baileys';
 import Long from 'long';
 
-import { settle } from './baileys-service';
+import { makeService, settle } from './baileys-service';
+import { stubAuthState } from './connect';
 
 export const OWNER = { id: '972529998877:14@s.whatsapp.net', lid: '987654321098765:14@lid', name: 'Noa Barak' };
 export const PERSON = { pn: '972541112233@s.whatsapp.net', lid: '123456789012345@lid', saved: 'Dana Levi', push: 'Dana' };
@@ -83,4 +87,23 @@ export async function playSession(service: any) {
     },
   ]);
   await settle(service);
+}
+
+/**
+ * Record the session under `root` the way a live check does (LIVE_RECORD_DIR) and
+ * return the raw session directory. The calling test mocks makeWASocket.
+ */
+export async function recordSession(root: string, opts: { msgCall?: string } = {}) {
+  process.env.LIVE_RECORD_DIR = root;
+  try {
+    const { service, prisma } = await makeService();
+    if (opts.msgCall) prisma.setting.rows.push({ instanceId: 'inst-1', msgCall: opts.msgCall });
+    stubAuthState(service);
+    await service.connectToWhatsapp();
+    await playSession(service);
+  } finally {
+    delete process.env.LIVE_RECORD_DIR;
+  }
+  const [session] = readdirSync(join(root, 'test'));
+  return join(root, 'test', session);
 }

@@ -231,6 +231,12 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+/** Whether a media download asked the phone to re-upload an expired file, and how that ended. */
+type MediaReupload = 'not_requested' | 'ok' | 'failed';
+
+/** The HTTP status a Baileys media error carries (a Boom's output.statusCode), or 'none'. */
+const httpStatus = (error: any) => error?.output?.statusCode ?? error?.status ?? 'none';
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -4380,6 +4386,8 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
+    // Set once a download is attempted: whether the phone was asked to re-upload an expired file.
+    let reupload: MediaReupload | undefined;
     try {
       const m = data?.message;
       const convertToMp4 = data?.convertToMp4 ?? false;
@@ -4439,15 +4447,35 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       let buffer: Buffer;
+      const media = `message=${msg?.key?.id}, chat=${jidKind(msg?.key?.remoteJid)}`;
+      reupload = 'not_requested';
+      const reuploadRequest = async (message: WAMessage) => {
+        this.logger.warn(`media download: ${media}, outcome=reupload_requested`);
+        try {
+          const updated = await this.client.updateMediaMessage(message);
+          reupload = 'ok';
+          this.logger.warn(`media download: ${media}, outcome=reupload_ok`);
+          return updated;
+        } catch (error) {
+          reupload = 'failed';
+          this.logger.warn(
+            `media download: ${media}, outcome=reupload_failed, error=${error?.name ?? 'unknown'}, status=${httpStatus(error)}`,
+          );
+          throw error;
+        }
+      };
 
       try {
         buffer = await downloadMediaMessage(
           { key: msg?.key, message: msg?.message },
           'buffer',
           this.mediaDownloadOptions(),
-          { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
+          { logger: makeBaileysLogger('error') as any, reuploadRequest },
         );
-      } catch {
+      } catch (error) {
+        this.logger.error(
+          `media download: ${media}, outcome=download_failed, status=${httpStatus(error)}, reupload=${reupload}`,
+        );
         this.logger.error('Download Media failed, trying to retry in 5 seconds...');
         await new Promise((resolve) => setTimeout(resolve, 5000));
         const mediaType = Object.keys(msg.message).find((key) => key.endsWith('Message'));
@@ -4519,7 +4547,13 @@ export class BaileysStartupService extends ChannelStartupService {
     } catch (error) {
       this.logger.error('Error processing media message:');
       this.logger.error(error);
-      throw new BadRequestException(error.toString());
+      if (reupload === undefined) throw new BadRequestException(error.toString());
+      // The same 400, plus whether the phone was asked to re-upload the file.
+      try {
+        new BadRequestException(error.toString());
+      } catch (badRequest) {
+        throw { ...badRequest, reupload };
+      }
     }
   }
 

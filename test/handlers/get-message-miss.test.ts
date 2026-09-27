@@ -7,6 +7,8 @@
 // Evolution answers a database miss with `{ conversation: '' }`, so the recipient
 // is sent an empty message. A deployment that stores no messages (for example
 // DATABASE_SAVE_DATA_NEW_MESSAGE=false, the `minimal` profile) misses every time.
+// A lookup that THROWS (a database blip) took the catch path, which answered the
+// same `{ conversation: '' }`, so the retry was used up on an empty message too.
 import { vi } from 'vitest';
 
 vi.mock('@api/server.module', () => import('../helpers/fake-server-module'));
@@ -51,6 +53,34 @@ describe('getMessage, as Baileys calls it to answer a retry request', () => {
       'messages.upsert': { messages: [{ key, message: { conversation: 'the real text' }, messageTimestamp: 1_700_000_000 }], type: 'notify' },
     });
     expect(prisma.message.rows.map((r: any) => r.key?.id)).toEqual([key.id]);
+    expect(await service.getMessage(key)).toEqual({ conversation: 'the real text' });
+  });
+});
+
+describe('getMessage, when the database lookup fails', () => {
+  it.each<Profile>(['minimal', 'stored'])('under the %s profile, answers undefined, not an empty message', async (profile) => {
+    const { service, prisma } = await makeService({ profile });
+    prisma.$queryRaw = async () => {
+      throw new Error('Connection terminated unexpectedly');
+    };
+    const key = { remoteJid: CHAT, fromMe: true, id: '3EB0BLIP0000000000001' };
+    expect(await service.getMessage(key)).toBeUndefined();
+    expect(await service.getMessage(key, true)).toBeUndefined();
+  });
+
+  it('under the stored profile, once the database answers again, the stored message is returned as stored', async () => {
+    const { service, prisma, ev } = await makeService({ profile: 'stored' });
+    answerFromRows(prisma);
+    const key = { remoteJid: CHAT, fromMe: true, id: '3EB0BLIP0000000000002' };
+    await deliver(service, ev, {
+      'messages.upsert': { messages: [{ key, message: { conversation: 'the real text' }, messageTimestamp: 1_700_000_000 }], type: 'notify' },
+    });
+    const working = prisma.$queryRaw;
+    prisma.$queryRaw = async () => {
+      throw new Error('Connection terminated unexpectedly');
+    };
+    expect(await service.getMessage(key)).toBeUndefined();
+    prisma.$queryRaw = working;
     expect(await service.getMessage(key)).toEqual({ conversation: 'the real text' });
   });
 });

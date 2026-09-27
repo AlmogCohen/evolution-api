@@ -16,7 +16,7 @@ const FIXTURE = 'test/fixtures/live/2026-09-27-rig-session';
 const CONTACT = { pn: '972500000001@s.whatsapp.net', lid: '100000000000001@lid' };
 
 /** Webhooks about the renamed contact only (the DM later in the session depends on the live database). */
-const aboutContact = (w: { data: any }) => JSON.stringify(encode(w.data)).includes(CONTACT.pn.split('@')[0]);
+const aboutContact = (w: Record<string, any>) => JSON.stringify(encode(w.data)).includes(CONTACT.pn.split('@')[0]);
 
 describe('live: a contact renamed on the phone after a restart', () => {
   it('reaches contacts.upsert as a mapping item and as a saved name, then contacts.update', async () => {

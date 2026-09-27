@@ -216,7 +216,10 @@ class Scrubber {
 
   private fakeId(s: string) {
     return this.memo(this.ids, s, (n) => {
-      if (/^\d+$/.test(s)) return s.slice(0, 2) + String(n).padStart(s.length - 2, '0').slice(2 - s.length);
+      if (/^\d+$/.test(s)) {
+        const counter = String(n).padStart(s.length - 2, '0');
+        return s.slice(0, 2) + counter.slice(2 - s.length);
+      }
       const body = n
         .toString(16)
         .toUpperCase()

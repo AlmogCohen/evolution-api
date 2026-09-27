@@ -738,7 +738,8 @@ export class BaileysStartupService extends ChannelStartupService {
       this.loadChatwoot();
       this.loadSettings();
       this.loadWebhook();
-      this.loadProxy();
+      // The socket, the version fetch and media all take their exit from localProxy: read it before connecting.
+      await this.loadProxy();
 
       // Remontar o messageProcessor para garantir que está funcionando após reconexão
       this.messageProcessor.mount({

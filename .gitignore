@@ -41,6 +41,9 @@ lerna-debug.log*
 
 /temp/*
 
+# Raw live-check recordings (docs/LIVE-CHECKS.md): never committed
+/live-records/
+
 .DS_Store
 *.DS_Store
 .tool-versions

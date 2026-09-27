@@ -37,6 +37,29 @@ without saying why in the commit.
   socket call, the HTTP answer. Assert exact fields, not substrings.
 - No test touches WhatsApp, a real account or the network beyond localhost.
 
+## Recordings and fixtures (live checks)
+
+A live check records a real session (`LIVE_RECORD_DIR`, `docs/LIVE-CHECKS.md`).
+Raw recordings hold real people's numbers, names and messages. Any agent or
+person working here follows these rules, with no exception:
+
+- Never commit, stage or copy anything from `LIVE_RECORD_DIR` (or
+  `live-records/`). Only the scrubber's output (`scripts/live-scrub.ts`) goes
+  into `test/fixtures/live/`.
+- Before committing a fixture, run `npx tsx scripts/live-guard.ts` and read
+  `scrub-report.json` (`"leakGate": "pass"`, counts that fit the check).
+- Open and skim every new fixture file yourself. The guard cannot recognise a
+  name or a message text; you can.
+- If anything looks like a phone number, a user part of an `@lid` or
+  `@s.whatsapp.net` address that is not a scrubber fake, a name, a message
+  text, a signed media URL (`mmg.whatsapp.net`, `oh=` / `oe=` parameters), an
+  email, a token or a key: stop. Fix the scrubber and scrub again. Never edit
+  a fixture by hand.
+- Never paste a raw recording, or any part of one, into a commit, an issue, a
+  pull request or a chat.
+- A fixture's replay test must fail when the behaviour it covers is broken:
+  run it once against the code before the fix and say so in the commit.
+
 ---
 
 # Evolution API - AI Agent Guidelines

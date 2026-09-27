@@ -68,6 +68,9 @@ named where one exists.
 - Profile pictures are looked up once per contact per hour, at most four at a time, and history never waits on them (#1883).
 - One pairing code per connect attempt, and a fresh QR budget per attempt (#2100, #2696).
 
+**Live checks**
+- A live check against a real phone can be recorded (`LIVE_RECORD_DIR`), scrubbed into a fixture behind a fail-closed leak gate, and replayed through the real event buffer and service in a test. The protocol, the check catalogue and the results log are in `docs/LIVE-CHECKS.md`.
+
 ## Licence
 
 Evolution API is licensed under the Apache License 2.0 with additional

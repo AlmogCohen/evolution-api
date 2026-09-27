@@ -1508,6 +1508,10 @@ export class BaileysStartupService extends ChannelStartupService {
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
         // imgUrl is set only by WhatsApp's picture notification: 'changed' or 'removed'.
+        if (contact.imgUrl === 'changed' || contact.imgUrl === 'removed') this.invalidatePicture(createJid(contact.id));
+        const renamed = contact?.name ?? contact?.verifiedName;
+        const awaiting = this.namesAwaitingPicture.get(contact.id);
+        if (renamed && awaiting) awaiting.name = renamed;
         if (contact.imgUrl === 'removed') this.pictureCache.set(createJid(contact.id), { url: null, at: Date.now() });
         contactsRaw.push({
           remoteJid: contact.id,
@@ -2762,17 +2766,41 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
-  /** Look up the pictures of contacts from contacts.upsert (history, address book) and send them on contacts.update. */
+  // The newest name of each contact whose picture contactPictures is still looking up: a rename
+  // that arrives meanwhile (contacts.update) is what that update must carry, not the batch's name.
+  private readonly namesAwaitingPicture = new Map<string, { name: string; refs: number }>();
+
+  /**
+   * Look up the pictures of contacts from contacts.upsert (history, address book) and send them on
+   * contacts.update, with each contact's newest name (a rename that arrived while the lookups ran
+   * wins over the batch's). A contact whose picture WhatsApp said changed or was removed while its
+   * lookup ran is left out: that notification's own update is the newer one.
+   */
   private async contactPictures(contacts: Contact[]) {
+    const names = contacts.map((contact) => {
+      const name = contact?.name || contact?.verifiedName || contact.id.split('@')[0];
+      const entry = this.namesAwaitingPicture.get(contact.id) ?? { name, refs: 0 };
+      entry.name = name;
+      entry.refs++;
+      this.namesAwaitingPicture.set(contact.id, entry);
+      return entry;
+    });
     try {
-      const updatedContacts = await Promise.all(
-        contacts.map(async (contact) => ({
-          remoteJid: contact.id,
-          pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
-          profilePicUrl: (await this.cachedProfilePicture(contact.id, { bulk: true })).profilePictureUrl,
-          instanceId: this.instanceId,
-        })),
+      const looked = await Promise.all(
+        contacts.map(async (contact) => {
+          const version = this.pictureVersion(createJid(contact.id));
+          const { profilePictureUrl } = await this.cachedProfilePicture(contact.id, { bulk: true });
+          return { contact, version, profilePictureUrl };
+        }),
       );
+      const updatedContacts = looked
+        .filter(({ contact, version }) => this.pictureVersion(createJid(contact.id)) === version)
+        .map(({ contact, profilePictureUrl }) => ({
+          remoteJid: contact.id,
+          pushName: this.namesAwaitingPicture.get(contact.id)?.name,
+          profilePicUrl: profilePictureUrl,
+          instanceId: this.instanceId,
+        }));
 
       if (updatedContacts.length > 0) {
         const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
@@ -2809,12 +2837,23 @@ export class BaileysStartupService extends ChannelStartupService {
       }
     } catch (error) {
       this.logger.error(`Error: ${error.message}`);
+    } finally {
+      for (const [i, contact] of contacts.entries()) {
+        const entry = names[i];
+        if (--entry.refs <= 0 && this.namesAwaitingPicture.get(contact.id) === entry) {
+          this.namesAwaitingPicture.delete(contact.id);
+        }
+      }
     }
   }
 
-  /** Asks WhatsApp now (an explicit request), and keeps the answer for the event handlers. */
+  /**
+   * Asks WhatsApp now (an explicit request), and keeps the answer for the event handlers, unless
+   * WhatsApp said the picture changed or was removed while it was asking: that is newer.
+   */
   public async profilePicture(number: string) {
     const jid = createJid(number);
+    const version = this.pictureVersion(jid);
     let profilePictureUrl: string | null;
 
     try {
@@ -2823,8 +2862,19 @@ export class BaileysStartupService extends ChannelStartupService {
       profilePictureUrl = null;
     }
 
-    this.pictureCache.set(jid, { url: profilePictureUrl, at: Date.now() });
+    if (this.pictureVersion(jid) === version) this.pictureCache.set(jid, { url: profilePictureUrl, at: Date.now() });
     return { wuid: jid, profilePictureUrl };
+  }
+
+  /** Bumped by WhatsApp's picture notification, so a lookup started before it cannot overwrite it. */
+  private readonly pictureVersions = new Map<string, number>();
+  private pictureVersion(jid: string) {
+    return this.pictureVersions.get(jid) ?? 0;
+  }
+  private invalidatePicture(jid: string) {
+    this.pictureVersions.set(jid, this.pictureVersion(jid) + 1);
+    this.pictureCache.delete(jid);
+    this.pictureLookups.delete(jid);
   }
 
   /**

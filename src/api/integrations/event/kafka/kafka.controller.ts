@@ -4,7 +4,7 @@ import { configService, Kafka, Log } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { Consumer, ConsumerConfig, Kafka as KafkaJS, KafkaConfig, Producer, ProducerConfig } from 'kafkajs';
 
-import { EmitData, EventController, EventControllerInterface } from '../event.controller';
+import { EmitData, EventController, EventControllerInterface, isSubscribed } from '../event.controller';
 
 export class KafkaController extends EventController implements EventControllerInterface {
   private kafkaClient: KafkaJS | null = null;
@@ -299,7 +299,7 @@ export class KafkaController extends EventController implements EventControllerI
     const messageValue = JSON.stringify(message);
 
     // Instance-specific events
-    if (instanceKafka?.enabled && this.producer && Array.isArray(kafkaLocal) && kafkaLocal.includes(we)) {
+    if (instanceKafka?.enabled && this.producer && isSubscribed(kafkaLocal, we)) {
       const topicName = this.getTopicName(event, false, instanceName);
 
       let retry = 0;
@@ -345,7 +345,7 @@ export class KafkaController extends EventController implements EventControllerI
     }
 
     // Global events
-    if (kafkaGlobal && kafkaEvents[we] && this.producer) {
+    if (kafkaGlobal && isSubscribed(kafkaEvents, we) && this.producer) {
       const topicName = this.getTopicName(event, true);
 
       let retry = 0;

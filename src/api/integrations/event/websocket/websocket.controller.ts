@@ -5,7 +5,7 @@ import { Logger } from '@config/logger.config';
 import { Server } from 'http';
 import { Server as SocketIO } from 'socket.io';
 
-import { EmitData, EventController, EventControllerInterface } from '../event.controller';
+import { EmitData, EventController, EventControllerInterface, isSubscribed } from '../event.controller';
 
 export class WebsocketController extends EventController implements EventControllerInterface {
   private io: SocketIO;
@@ -156,7 +156,7 @@ export class WebsocketController extends EventController implements EventControl
         return;
       }
 
-      if (Array.isArray(instance?.events) && instance?.events.includes(configEv)) {
+      if (isSubscribed(instance?.events, configEv)) {
         this.socket.of(`/${instanceName}`).emit(event, message);
 
         if (logEnabled) {

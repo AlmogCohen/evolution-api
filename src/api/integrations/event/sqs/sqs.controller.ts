@@ -5,7 +5,7 @@ import { CreateQueueCommand, DeleteQueueCommand, ListQueuesCommand, SQS } from '
 import { configService, HttpServer, Log, S3, Sqs } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 
-import { EmitData, EventController, EventControllerInterface } from '../event.controller';
+import { EmitData, EventController, EventControllerInterface, isSubscribed } from '../event.controller';
 import { EventDto } from '../event.dto';
 
 export class SqsController extends EventController implements EventControllerInterface {
@@ -119,7 +119,7 @@ export class SqsController extends EventController implements EventControllerInt
         }
       }
 
-      if (Array.isArray(sqsEvents) && sqsEvents.includes(we)) {
+      if (isSubscribed(sqsEvents, we)) {
         const prefixName = sqsConfig.GLOBAL_ENABLED ? sqsConfig.GLOBAL_PREFIX_NAME : instanceName;
         const eventFormatted =
           sqsConfig.GLOBAL_ENABLED && sqsConfig.GLOBAL_FORCE_SINGLE_QUEUE

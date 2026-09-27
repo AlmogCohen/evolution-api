@@ -10,11 +10,12 @@
 // that check never matches and rc14 never asks. Evolution asks itself when
 // Baileys did not.
 //
-// A 403 asks the phone only when the media link itself has expired: its `oe`
-// query parameter (hex unix seconds, read from the url, else the directPath)
-// has passed. Measured on WhatsApp's media CDN (2026-09-27, 84 history-sync
-// attachments): 403 on 34 of 34 links whose `oe` had passed, on 0 of 50 valid
-// ones, and a valid link to a file the CDN dropped answered 404 or 410.
+// A 403 asks the phone only when the link that actually failed carries an `oe`
+// query parameter (hex unix seconds) that has passed by the local clock. A
+// conservative heuristic, not a documented contract: measured on WhatsApp's media
+// CDN (2026-09-27, 84 history-sync attachments), 403 on 34 of 34 links whose `oe`
+// had passed, on 0 of 50 valid ones, and a valid link to a file the CDN dropped
+// answered 404 or 410.
 import { vi } from 'vitest';
 
 vi.mock('@api/server.module', () => import('../helpers/fake-server-module'));
@@ -24,7 +25,7 @@ import { readFile, rm } from 'node:fs/promises';
 import { MEDIA_REUPLOAD_TIMEOUT_MS } from '@api/integrations/channel/whatsapp/whatsapp.baileys.service';
 import { encryptedStream } from 'baileys';
 import { getGlobalDispatcher, MockAgent, setGlobalDispatcher } from 'undici';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { makeService } from '../helpers/baileys-service';
 import { captureOutput } from '../helpers/capture-output';
@@ -300,5 +301,175 @@ describe('an expired media download asks the phone to re-upload, once', () => {
     expect(thrown).toEqual(badRequest('not_requested'));
     expect(lines).toEqual([line('outcome=download_failed, status=500, reupload=not_requested')]);
     expectNothingPrivate(out);
+  });
+});
+
+// Which link a 403 is judged by: the one the download actually requested. Baileys
+// downloads the directPath (over https, from the url's host) when the message has one,
+// and the url only otherwise; its error carries the link it requested (Boom data.url).
+// An error without a link falls back to that same choice, never to the other link.
+// `oe` is read as a query parameter: case-sensitive name, percent-decoded, never from
+// the fragment, exactly one value, plain hex. The comparison uses the local clock, so
+// these tests fix it.
+describe('a 403 is judged by the link that actually failed', () => {
+  const NOW = 1_790_000_000;
+  const hex = (unixSeconds: number) => unixSeconds.toString(16).toUpperCase();
+  const signed = (path: string, expiry: string) => `${path}?ccb=11-4&oh=01_Q5Aa&oe=${expiry}&_nc_sid=5e03e0`;
+  const EXPIRED = hex(NOW - DAY);
+  const VALID = hex(NOW + 14 * DAY);
+  const FORBIDDEN = '/v/t62.7118-24/forbidden.enc';
+  const OTHER = '/v/t62.7118-24/other.enc';
+
+  let tlsCdn: Listening;
+  let untrust: () => void;
+  let clock: { mockRestore: () => void };
+  let fetchSpy: { mockRestore: () => void } | undefined;
+
+  beforeAll(async () => {
+    // Both links are served over https here, since a directPath always is.
+    untrust = trustTestCertificate();
+    tlsCdn = await startHttpsServer((req, _body, res) => {
+      if (req.url === LIVE) return void res.writeHead(200, { 'content-length': liveBody.length }).end(liveBody);
+      res.writeHead(403).end();
+    });
+  });
+
+  afterAll(async () => {
+    await tlsCdn.close();
+    untrust();
+  });
+
+  beforeEach(() => {
+    tlsCdn.log.splice(0);
+    clock = vi.spyOn(Date, 'now').mockReturnValue(NOW * 1000);
+  });
+
+  afterEach(() => {
+    clock.mockRestore();
+    fetchSpy?.mockRestore();
+    fetchSpy = undefined;
+  });
+
+  /** An image whose url and directPath (when given) point at the https CDN. */
+  const image = (urlPath: string, directPath?: string) => {
+    const message: any = expiredImage();
+    message.message.imageMessage.url = `https://127.0.0.1:${tlsCdn.port}${urlPath}`;
+    if (directPath !== undefined) message.message.imageMessage.directPath = directPath;
+    return message;
+  };
+
+  /** A service whose phone re-uploads to LIVE, refreshing both links as Baileys does. */
+  async function run(message: any) {
+    const { service } = await makeService();
+    const asked: string[] = [];
+    service.client.updateMediaMessage = async (m: any) => {
+      asked.push(m.key.id);
+      m.message.imageMessage.url = `https://127.0.0.1:${tlsCdn.port}${LIVE}`;
+      if (m.message.imageMessage.directPath) m.message.imageMessage.directPath = LIVE;
+      return m;
+    };
+    let result: any;
+    let thrown: any;
+    await captureOutput(async () => {
+      try {
+        result = await service.getBase64FromMediaMessage({ message });
+      } catch (e) {
+        thrown = e;
+      }
+    });
+    return { result, thrown, asked };
+  }
+
+  async function expectReupload(message: any, requested: string[]) {
+    const { result, thrown, asked } = await run(message);
+
+    expect(thrown).toBeUndefined();
+    expect(Buffer.from(result.base64, 'base64').equals(PLAIN)).toBe(true);
+    expect(asked).toEqual([ID]);
+    expect(tlsCdn.log).toEqual([...requested, LIVE].map((p) => `GET ${p}`));
+  }
+
+  async function expectNoReupload(message: any, requested: string[]) {
+    const { thrown, asked } = await run(message);
+
+    expect(asked).toEqual([]);
+    expect(thrown).toEqual(badRequest('not_requested'));
+    expect(tlsCdn.log).toEqual(requested.map((p) => `GET ${p}`));
+  }
+
+  it.each([
+    ['a day past', EXPIRED],
+    ['exactly now', hex(NOW)],
+    ['a day past, in lowercase hex', EXPIRED.toLowerCase()],
+    ['a day past, percent-encoded', [...EXPIRED].map((c) => `%${c.charCodeAt(0).toString(16)}`).join('')],
+  ])('asks the phone when the oe of the url that failed is %s', async (_, expiry) => {
+    const path = signed(FORBIDDEN, expiry);
+
+    await expectReupload(image(path), [path]);
+  });
+
+  it.each([
+    ['one second from now', signed(FORBIDDEN, hex(NOW + 1))],
+    ['14 days from now', signed(FORBIDDEN, VALID)],
+    ['missing', FORBIDDEN],
+    ['empty', signed(FORBIDDEN, '')],
+    ['not hex', signed(FORBIDDEN, `${EXPIRED}Z`)],
+    ['0x-prefixed', signed(FORBIDDEN, `0x${EXPIRED}`)],
+    ['too large to be a time', signed(FORBIDDEN, 'F'.repeat(20))],
+    ['given twice', `${FORBIDDEN}?oe=${EXPIRED}&oe=${EXPIRED}`],
+    ['spelled OE', `${FORBIDDEN}?OE=${EXPIRED}`],
+  ])('does not ask the phone when the oe of the url that failed is %s', async (_, path) => {
+    await expectNoReupload(image(path), [path]);
+  });
+
+  it('ignores an oe in the fragment, which is never sent', async () => {
+    await expectNoReupload(image(`${FORBIDDEN}#top?oe=${EXPIRED}`), [FORBIDDEN]);
+  });
+
+  it('does not ask the phone when the url has expired but the directPath that failed has not', async () => {
+    const directPath = signed(FORBIDDEN, VALID);
+
+    await expectNoReupload(image(signed(OTHER, EXPIRED), directPath), [directPath]);
+  });
+
+  it('asks the phone when the directPath that failed has expired though the url has not', async () => {
+    const directPath = signed(FORBIDDEN, EXPIRED);
+
+    await expectReupload(image(signed(OTHER, VALID), directPath), [directPath]);
+  });
+
+  it('does not ask the phone when the url has expired but the directPath that failed has no oe', async () => {
+    await expectNoReupload(image(signed(OTHER, EXPIRED), FORBIDDEN), [FORBIDDEN]);
+  });
+
+  describe('when the error does not say which link failed', () => {
+    // An error with a numeric status and no link, before any request reaches the CDN.
+    function failFirstFetch() {
+      const realFetch = globalThis.fetch;
+      let failed = false;
+      fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (...args) => {
+        if (failed) return realFetch(...args);
+        failed = true;
+        throw Object.assign(new Error('forbidden'), { status: 403 });
+      });
+    }
+
+    it('judges by the directPath, which the download requests first', async () => {
+      failFirstFetch();
+
+      await expectReupload(image(signed(OTHER, VALID), signed(FORBIDDEN, EXPIRED)), []);
+    });
+
+    it('does not fall back to an expired url when there is a directPath', async () => {
+      failFirstFetch();
+
+      await expectNoReupload(image(signed(OTHER, EXPIRED), signed(FORBIDDEN, VALID)), []);
+    });
+
+    it('judges by the url when there is no directPath', async () => {
+      failFirstFetch();
+
+      await expectReupload(image(signed(FORBIDDEN, EXPIRED)), []);
+    });
   });
 });

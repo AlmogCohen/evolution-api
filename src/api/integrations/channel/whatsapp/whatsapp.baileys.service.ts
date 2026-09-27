@@ -274,6 +274,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public phoneNumber: string;
 
+  // The socket a pairing code was requested on. Baileys' requestPairingCode makes
+  // a new code and pushes a notification to the phone, so it is asked once per
+  // socket, not on every QR refresh (which would kill the code being typed).
+  private pairingCodeSocket?: WASocket;
+
   public get connectionStatus() {
     return this.stateConnection;
   }
@@ -409,8 +414,16 @@ export class BaileysStartupService extends ChannelStartupService {
       };
 
       if (this.phoneNumber) {
-        await delay(1000);
-        this.instance.qrcode.pairingCode = await this.client.requestPairingCode(this.phoneNumber);
+        if (this.pairingCodeSocket !== this.client) {
+          const socket = (this.pairingCodeSocket = this.client);
+          try {
+            await delay(1000);
+            this.instance.qrcode.pairingCode = await socket.requestPairingCode(this.phoneNumber);
+          } catch (error) {
+            if (this.pairingCodeSocket === socket) this.pairingCodeSocket = undefined;
+            throw error;
+          }
+        }
       } else {
         this.instance.qrcode.pairingCode = null;
       }
@@ -464,7 +477,8 @@ export class BaileysStartupService extends ChannelStartupService {
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+        // Baileys' own reconnect (QR refs ended, a dropped socket) is the same attempt: the QR budget carries over.
+        await this.connect(this.phoneNumber);
       } else {
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
@@ -766,7 +780,13 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.client;
   }
 
+  /** A new connect attempt: a fresh QR budget, and no QR or pairing code left from an earlier attempt. */
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    this.instance.qrcode = { count: 0 };
+    return await this.connect(number);
+  }
+
+  private async connect(number?: string): Promise<WASocket> {
     try {
       this.loadChatwoot();
       // The socket takes syncFullHistory, groupsIgnore, readStatus and alwaysOnline as config: read them first.

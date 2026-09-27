@@ -24,22 +24,28 @@ export async function keyExists(sessionId: string): Promise<any> {
   return !!key;
 }
 
+// A failed write is not a saved one: saveKey lets it propagate, so saveCreds rejects and its
+// caller can try again, instead of running on creds that exist only in memory.
 export async function saveKey(sessionId: string, keyJson: any): Promise<any> {
-  try {
-    const exists = await keyExists(sessionId);
-    if (!exists)
-      return await prismaRepository.session.create({
-        data: {
-          sessionId: sessionId,
-          creds: JSON.stringify(keyJson),
-        },
-      });
-    await prismaRepository.session.update({
-      where: { sessionId: sessionId },
-      data: { creds: JSON.stringify(keyJson) },
+  const exists = await keyExists(sessionId);
+  if (!exists)
+    return await prismaRepository.session.create({
+      data: {
+        sessionId: sessionId,
+        creds: JSON.stringify(keyJson),
+      },
     });
-  } catch {
-    return null;
+  await prismaRepository.session.update({
+    where: { sessionId: sessionId },
+    data: { creds: JSON.stringify(keyJson) },
+  });
+}
+
+/** Stored creds that cannot be read are not an absent session: starting fresh would overwrite them. */
+export class UnreadableCredsError extends Error {
+  constructor(sessionId: string) {
+    super(`The stored creds of session ${sessionId} cannot be read: not replacing them`);
+    this.name = 'UnreadableCredsError';
   }
 }
 
@@ -49,7 +55,7 @@ export async function getAuthKey(sessionId: string): Promise<any> {
   try {
     return JSON.parse(auth.creds);
   } catch {
-    return null;
+    throw new UnreadableCredsError(sessionId);
   }
 }
 
@@ -118,12 +124,15 @@ export default async function useMultiFileAuthStatePrisma(
           return JSON.parse(rawData, BufferJSON.reviver);
         }
       } else {
-        rawData = storedCreds;
+        if (storedCreds === null || storedCreds === undefined) return null;
+        try {
+          return JSON.parse(storedCreds, BufferJSON.reviver);
+        } catch {
+          throw new UnreadableCredsError(sessionId);
+        }
       }
-
-      const parsedData = JSON.parse(rawData, BufferJSON.reviver);
-      return parsedData;
-    } catch {
+    } catch (error) {
+      if (error instanceof UnreadableCredsError) throw error;
       return null;
     }
   }

@@ -1366,6 +1366,33 @@ export class BaileysStartupService extends ChannelStartupService {
     }, delay);
   }
 
+  private credsRetry: NodeJS.Timeout | null = null;
+  private credsRetryAttempts = 0;
+
+  /**
+   * Save the creds a creds.update changed. A failed save is tried again (1s, 2s, 4s... up to 30s)
+   * with the creds as they are by then, until one lands: the creds live in memory meanwhile, and a
+   * restart before it would open the old ones.
+   */
+  private saveCreds() {
+    const authState = this.instance.authState;
+    if (!authState?.saveCreds) return;
+    Promise.resolve()
+      .then(() => authState.saveCreds())
+      .then(() => {
+        this.credsRetryAttempts = 0;
+      })
+      .catch((error) => {
+        this.logger.error({ message: 'Could not save the creds, trying again', error: errorFields(error) });
+        if (this.credsRetry || this.shutDown || authState !== this.instance.authState) return;
+        const delay = Math.min(1_000 * 2 ** this.credsRetryAttempts++, 30_000);
+        this.credsRetry = setTimeout(() => {
+          this.credsRetry = null;
+          this.saveCreds();
+        }, delay);
+      });
+  }
+
   /** A connect failed before it built a socket (so no close will retry it): try again after the backoff. */
   public retryConnect() {
     if (!this.reconnectTimer && !this.connecting) this.scheduleReconnect();
@@ -2595,7 +2622,7 @@ export class BaileysStartupService extends ChannelStartupService {
         try {
           // A logout under way: nothing is forwarded or stored; the connection only delivers the logout.
           if (this.logout) {
-            if (events['creds.update']) this.instance.authState.saveCreds();
+            if (events['creds.update']) this.saveCreds();
             if (events['connection.update']) await this.logoutUpdate(events['connection.update'], client);
             return;
           }
@@ -2634,7 +2661,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['creds.update']) {
-              this.instance.authState.saveCreds();
+              this.saveCreds();
             }
 
             if (events['lid-mapping.update']) {

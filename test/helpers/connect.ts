@@ -12,7 +12,11 @@ import { makeService } from './baileys-service';
 export function fakeSocket() {
   return {
     ev: makeEventBuffer(P({ level: 'silent' }) as any),
-    ws: new EventEmitter(),
+    ws: Object.assign(new EventEmitter(), { close: () => undefined }),
+    // connectionUpdate reads the account on 'open', and logoutInstance logs the socket out.
+    user: { id: '972500000000:1@s.whatsapp.net' },
+    profilePictureUrl: async () => undefined,
+    logout: async () => undefined,
     end: () => undefined,
   };
 }

@@ -5,13 +5,16 @@
 // server's own IP. The proxy here maps those two hosts to local HTTPS servers.
 import { vi } from 'vitest';
 
-const { socketSpy } = vi.hoisted(() => ({ socketSpy: vi.fn() }));
+const { socketSpy, baileysVersion } = vi.hoisted(() => ({ socketSpy: vi.fn(), baileysVersion: { value: undefined } }));
 
 vi.mock('@api/server.module', () => import('../helpers/fake-server-module'));
 vi.mock('baileys', async (importOriginal) => {
   const orig = await importOriginal<any>();
+  baileysVersion.value = orig.DEFAULT_CONNECTION_CONFIG.version;
   return { ...orig, default: socketSpy, makeWASocket: socketSpy };
 });
+
+import net from 'node:net';
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
@@ -101,5 +104,59 @@ describe('the WhatsApp Web version fetch on connect', () => {
     expect(proxy.log).toEqual([via('http', 'web.whatsapp.com'), via('http', 'raw.githubusercontent.com')]);
     expect(github.log).toEqual([`GET ${BAILEYS_DEFAULTS}`]);
     expect(config.version).toEqual([2, 3000, 1011111111]);
+  });
+});
+
+/** An exit that has died: it accepts the TCP connection and never answers. Logs one line per connection. */
+async function startDeadExit(): Promise<Listening> {
+  const log: string[] = [];
+  const held = new Set<net.Socket>();
+  const server = net.createServer((s) => {
+    log.push('connection');
+    held.add(s);
+    s.on('error', () => undefined);
+    s.on('close', () => held.delete(s));
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  return {
+    port: (server.address() as net.AddressInfo).port,
+    log,
+    close: () =>
+      new Promise<void>((r) => {
+        held.forEach((s) => s.destroy());
+        server.close(() => r());
+      }),
+  };
+}
+
+// Kept last in the file: before the fix the connect it starts never finishes.
+describe('when the exit never answers', () => {
+  it('gives up on the version fetch after 10s and connects with the version Baileys ships', async () => {
+    const realSetTimeout = globalThis.setTimeout;
+    const dead = await startDeadExit();
+    proxies.push(dead);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      const connecting = connectBehind(socketSpy, { protocol: 'http', port: dead.port });
+      let settled = false;
+      connecting.then(
+        () => (settled = true),
+        () => (settled = true),
+      );
+      // Not vi.waitFor: under fake timers it advances the clock while it polls.
+      for (let i = 0; i < 200 && dead.log.length === 0; i++) await new Promise((r) => realSetTimeout(r, 10));
+      expect(dead.log).toEqual(['connection']);
+      await vi.advanceTimersByTimeAsync(9_999);
+      const early = settled ? 'connected' : 'waiting';
+      await vi.advanceTimersByTimeAsync(1);
+      const outcome = await Promise.race([
+        connecting.then(({ config }) => config.version),
+        new Promise((r) => realSetTimeout(() => r('still waiting on the version fetch'), 2_000)),
+      ]);
+      expect({ early, outcome }).toEqual({ early: 'waiting', outcome: baileysVersion.value });
+      expect(guard.refused).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -78,7 +78,12 @@ describe('the prisma auth store on a database error', () => {
       ...outcome,
       rows: prismaRepository.session.rows.filter((r: any) => r.sessionId === SESSION).length,
       credsUnchanged: storedRow()?.creds === before,
-    }).toEqual({ opened: false, error: "Can't reach database server at `127.0.0.1:5432`", rows: 1, credsUnchanged: true });
+    }).toEqual({
+      opened: false,
+      error: "Can't reach database server at `127.0.0.1:5432`",
+      rows: 1,
+      credsUnchanged: true,
+    });
 
     // The retried connect opens the linked session.
     const retried = await open();
@@ -92,5 +97,41 @@ describe('the prisma auth store on a database error', () => {
     expect(fresh.state.creds.me).toBeUndefined();
     expect(fresh.state.creds.registered).toBe(false);
     expect(storedRow('new-session')).toBeDefined();
+  });
+});
+
+// Writing had the same flaw as reading: saveKey swallowed any error and returned null, so saveCreds
+// resolved while the creds were only in memory, and a restart then opened the old ones. And a
+// stored creds row that cannot be parsed read as no session at all: the store started fresh and
+// wrote the fresh creds over it.
+describe('the prisma auth store on a failed write, and on unreadable creds', () => {
+  it('saveCreds fails when the creds cannot be written', async () => {
+    const linked = await open();
+    Object.assign(linked.state.creds, { me: ME, registered: true });
+    const update = prismaRepository.session.update;
+    prismaRepository.session.update = async () => {
+      throw Object.assign(new Error("Can't reach database server"), { code: 'P1001' });
+    };
+    let outcome: string;
+    try {
+      outcome = await linked.saveCreds().then(
+        () => 'saved',
+        () => 'failed',
+      );
+    } finally {
+      prismaRepository.session.update = update;
+    }
+    expect(outcome).toBe('failed');
+  });
+
+  it('a stored creds row that cannot be parsed fails the open and is left as it is', async () => {
+    await open();
+    const corrupt = '{"noiseKey": {"private": {"type": "Buffer", "data": "tru';
+    storedRow()!.creds = corrupt;
+    const outcome = await open().then(
+      () => 'opened',
+      () => 'failed',
+    );
+    expect({ outcome, unchanged: storedRow()!.creds === corrupt }).toEqual({ outcome: 'failed', unchanged: true });
   });
 });

@@ -17,13 +17,18 @@ export function jidKind(jid: unknown): string {
 
 /**
  * Mask anything in a diagnostic string that looks like a URL, a JID or a phone
- * number. A URL goes first, and whole: a WhatsApp media link is signed per
- * message (`oh`, `oe` in its query), and whoever holds it can fetch the file.
+ * number, and anything quoted. A URL goes first, and whole: a WhatsApp media
+ * link is signed per message (`oh`, `oe` in its query), and whoever holds it can
+ * fetch the file. A quoted part is input an error repeats (JSON.parse quotes
+ * what it failed on); a phone number is masked also as a person writes it, with
+ * spaces, dashes, dots or brackets.
  */
 export function scrub(value: unknown): string {
   return String(value ?? '')
     .replace(/[a-z][a-z0-9+.-]*:\/\/[^\s'"<>]+/gi, '[url]')
     .replace(/[^\s'"<>=,;:()[\]{}]+@[^\s'"<>=,;:()[\]{}]+/g, '[jid]')
+    .replace(/"[^"\n]{2,}"|'[^'\n]{2,}'|`[^`\n]{2,}`/g, '[quoted]')
+    .replace(/\+?\(?\d[\d\s().-]{5,}\d/g, (run) => (run.replace(/\D/g, '').length >= 7 ? '[number]' : run))
     .replace(/\d{6,}/g, '[number]');
 }
 

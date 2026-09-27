@@ -165,4 +165,55 @@ describe('one instance, one socket', () => {
     await waitOutAnyReconnect();
     expect({ built: built().length, live: live().length }).toEqual({ built: 2, live: 1 });
   });
+
+  // Two more ways a socket was built outside that guard: reloadConnection (after a profile or privacy
+  // update) called createClient directly, and shutdown (the instance is removed) did not stop a
+  // socket already being built, which then went live for an instance that no longer exists.
+  describe('every socket goes through the same guard', () => {
+    /** Hold the next socket build at its first wait (reading the auth state) until released. */
+    function holdNextBuild(s: any) {
+      let release: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const read = s.defineAuthState;
+      s.defineAuthState = async () => {
+        await gate;
+        return read();
+      };
+      return () => release();
+    }
+
+    it('a reload while a connect is being built joins it: one socket', async () => {
+      const s = await service();
+      const release = holdNextBuild(s);
+      const connect = s.connectToWhatsapp();
+      await flush();
+      const reload = s.reloadConnection();
+      await flush();
+      release();
+      await Promise.all([connect, reload]);
+      await waitOutAnyReconnect();
+      expect({ built: built().length, live: live().length }).toEqual({ built: 1, live: 1 });
+    });
+
+    it('a socket being built when the instance is shut down never goes live', async () => {
+      const s = await service();
+      const release = holdNextBuild(s);
+      const connect = s.connectToWhatsapp().catch(() => undefined);
+      await flush();
+      s.shutdown();
+      release();
+      await connect;
+      await waitOutAnyReconnect();
+      expect({ built: built().length, live: live().length }).toEqual({ built: 0, live: 0 });
+    });
+
+    it('a reload after the instance is shut down builds nothing', async () => {
+      const s = await service();
+      await s.connectToWhatsapp();
+      s.shutdown();
+      await s.reloadConnection().catch(() => undefined);
+      await waitOutAnyReconnect();
+      expect({ built: built().length, live: live().length }).toEqual({ built: 1, live: 0 });
+    });
+  });
 });

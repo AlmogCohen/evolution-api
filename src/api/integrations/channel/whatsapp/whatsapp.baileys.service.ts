@@ -251,6 +251,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
+  // A reconnectable close is retried after 1s, 2s, 4s... doubling to one a minute, for as long as
+  // it takes: an instance that gave up would sit disconnected on valid credentials. An open resets it.
+  private static readonly RECONNECT_FIRST_DELAY_MS = 1_000;
+  private static readonly RECONNECT_MAX_DELAY_MS = 60_000;
+  private reconnectAttempts = 0;
+  private reconnectTimer: NodeJS.Timeout | null = null;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   // The dispatcher media downloads go through: the instance's proxy, the same exit as the socket.
@@ -285,6 +291,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.stopReconnecting();
     this.messageProcessor.onDestroy();
     this.pictureCache.clear();
 
@@ -479,8 +486,9 @@ export class BaileysStartupService extends ChannelStartupService {
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       if (shouldReconnect) {
         // Baileys' own reconnect (QR refs ended, a dropped socket) is the same attempt: the QR budget carries over.
-        await this.connect(this.phoneNumber);
+        this.scheduleReconnect(statusCode);
       } else {
+        this.stopReconnecting();
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
@@ -516,6 +524,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      this.reconnectAttempts = 0;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -805,6 +814,34 @@ export class BaileysStartupService extends ChannelStartupService {
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
+    }
+  }
+
+  private scheduleReconnect(statusCode?: number) {
+    this.stopReconnecting();
+    const delay = Math.min(
+      BaileysStartupService.RECONNECT_FIRST_DELAY_MS * 2 ** Math.min(this.reconnectAttempts, 16),
+      BaileysStartupService.RECONNECT_MAX_DELAY_MS,
+    );
+    this.reconnectAttempts++;
+    this.logger.info(`Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}, status code ${statusCode})`);
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      try {
+        await this.connect(this.phoneNumber);
+      } catch (error) {
+        // No socket was built, so no close will come to retry it: schedule the next attempt here.
+        this.logger.error({ message: 'Reconnect attempt failed', error: error?.toString() });
+        this.scheduleReconnect(statusCode);
+      }
+    }, delay);
+  }
+
+  /** Drop a reconnect that is still waiting: the instance is being logged out or deleted. */
+  public stopReconnecting() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
     }
   }
 

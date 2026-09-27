@@ -392,6 +392,8 @@ export class WAMonitoringService {
   private removeInstance() {
     this.eventEmitter.on('remove.instance', async (instanceName: string) => {
       try {
+        // A reconnect waiting on its backoff would otherwise bring the removed instance back.
+        this.waInstances[instanceName]?.stopReconnecting?.();
         await this.waInstances[instanceName]?.sendDataWebhook(Events.REMOVE_INSTANCE, null);
 
         this.clearDelInstanceTime(instanceName);

@@ -16,18 +16,17 @@ const fixFileName = (file: string): string | undefined => {
   return replacedColon;
 };
 
+// A database error is not an absent session. keyExists and getAuthKey let it
+// propagate: turned into "no session", it made the store start a fresh one and
+// save it over the linked creds once the database answered again.
 export async function keyExists(sessionId: string): Promise<any> {
-  try {
-    const key = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
-    return !!key;
-  } catch {
-    return false;
-  }
+  const key = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
+  return !!key;
 }
 
 export async function saveKey(sessionId: string, keyJson: any): Promise<any> {
-  const exists = await keyExists(sessionId);
   try {
+    const exists = await keyExists(sessionId);
     if (!exists)
       return await prismaRepository.session.create({
         data: {
@@ -45,11 +44,10 @@ export async function saveKey(sessionId: string, keyJson: any): Promise<any> {
 }
 
 export async function getAuthKey(sessionId: string): Promise<any> {
+  const auth = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
+  if (!auth) return null;
   try {
-    const register = await keyExists(sessionId);
-    if (!register) return null;
-    const auth = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
-    return JSON.parse(auth?.creds);
+    return JSON.parse(auth.creds);
   } catch {
     return null;
   }
@@ -105,6 +103,8 @@ export default async function useMultiFileAuthStatePrisma(
   }
 
   async function readData(key: string): Promise<any> {
+    // Outside the try below: a failed creds read must fail the open, never read as "no creds".
+    const storedCreds = key === 'creds' ? await getAuthKey(sessionId) : undefined;
     try {
       let rawData;
       const cacheConfig = configService.get<CacheConf>('CACHE');
@@ -118,7 +118,7 @@ export default async function useMultiFileAuthStatePrisma(
           return JSON.parse(rawData, BufferJSON.reviver);
         }
       } else {
-        rawData = await getAuthKey(sessionId);
+        rawData = storedCreds;
       }
 
       const parsedData = JSON.parse(rawData, BufferJSON.reviver);

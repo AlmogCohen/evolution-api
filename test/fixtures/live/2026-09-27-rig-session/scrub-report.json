@@ -1,0 +1,12 @@
+{
+  "leakGate": "pass",
+  "events": 54,
+  "webhooks": 23,
+  "people": 3,
+  "groups": 1,
+  "names": 5,
+  "texts": 6,
+  "messageIds": 8,
+  "bytes": 13,
+  "urls": 4
+}

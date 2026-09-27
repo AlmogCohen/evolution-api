@@ -38,6 +38,7 @@ const ID = '3EB0DDDDDDDDDDDDDDD1';
 const PLAIN = Buffer.from('a photo, as the person sent it '.repeat(200));
 const LIVE = '/v/t62.7118-24/reuploaded.enc';
 const GONE = '/v/t62.7118-24/expired.enc';
+const GONE_403 = '/v/t62.7118-24/expired-403.enc';
 const GONE_MESSAGE =
   "The media is no longer on WhatsApp's servers (HTTP 404), and no re-upload from the phone was attempted (reupload: false)";
 
@@ -59,7 +60,7 @@ beforeAll(async () => {
   mediaKey = enc.mediaKey;
   const body = await readFile(enc.encFilePath);
   await rm(enc.encFilePath, { force: true });
-  cdn = await startCdn({ [LIVE]: body });
+  cdn = await startCdn({ [LIVE]: body, [GONE_403]: 403 });
   // Evolution waits 5s before its own fallback download; shortened, so a test that
   // takes it is not slow, and one that skips it is told apart by what it answers.
   const realSetTimeout = globalThis.setTimeout;
@@ -122,6 +123,19 @@ describe('a media download can skip asking the phone to re-upload', () => {
     expect(answer).toEqual({
       status: 400,
       body: { status: 400, error: 'Bad Request', response: { message: [GONE_MESSAGE], reupload: 'not_requested' } },
+    });
+  });
+
+  it('reupload: false and a CDN 403 (an expired file too): the phone is not asked, and the error says the file is gone', async () => {
+    const message = expiredImage();
+    message.message.imageMessage.url = `http://127.0.0.1:${cdn.port}${GONE_403}`;
+    const answer = await post({ message, reupload: false });
+
+    expect(asked).toEqual([]);
+    expect(cdn.log).toEqual([`GET ${GONE_403}`]);
+    expect(answer).toEqual({
+      status: 400,
+      body: { status: 400, error: 'Bad Request', response: { message: [GONE_MESSAGE.replace('HTTP 404', 'HTTP 403')], reupload: 'not_requested' } },
     });
   });
 

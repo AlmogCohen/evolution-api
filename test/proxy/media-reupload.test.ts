@@ -32,6 +32,7 @@ const LIVE = '/v/t62.7118-24/reuploaded.enc';
 const GONE = '/v/t62.7118-24/expired.enc';
 const GONE_AGAIN = '/v/t62.7118-24/expired-again.enc';
 const GONE_410 = '/v/t62.7118-24/expired-410.enc';
+const GONE_403 = '/v/t62.7118-24/expired-403.enc';
 const BROKEN = '/v/t62.7118-24/broken.enc';
 
 let cdn: Listening;
@@ -50,7 +51,7 @@ beforeAll(async () => {
   mediaKey = enc.mediaKey;
   const body = await readFile(enc.encFilePath);
   await rm(enc.encFilePath, { force: true });
-  cdn = await startCdn({ [LIVE]: body, [GONE_410]: 410, [BROKEN]: 500 });
+  cdn = await startCdn({ [LIVE]: body, [GONE_410]: 410, [GONE_403]: 403, [BROKEN]: 500 });
   // Evolution waits 5s before its own fallback download, and gives the phone a
   // bounded time to answer a re-upload request; both are shortened here.
   const realSetTimeout = globalThis.setTimeout;
@@ -172,6 +173,19 @@ describe('an expired media download asks the phone to re-upload, once', () => {
     expect(Buffer.from(result.base64, 'base64').equals(PLAIN)).toBe(true);
     expect(asked).toEqual([ID]);
     expect(cdn.log).toEqual([`GET ${GONE_410}`, `GET ${LIVE}`]);
+    expect(lines).toEqual([line('outcome=reupload_requested'), line('outcome=reupload_ok')]);
+  });
+
+  // Empirical (2026-09-27): media from a history sync, 30 to 180 days old, answered
+  // 403 on a real linked phone where 24-day-old media answered 410.
+  it('a CDN 403 asks the phone too', async () => {
+    const { service, asked } = await serviceWithPhone('reuploads');
+    const { result, thrown, lines } = await download(service, GONE_403);
+
+    expect(thrown).toBeUndefined();
+    expect(Buffer.from(result.base64, 'base64').equals(PLAIN)).toBe(true);
+    expect(asked).toEqual([ID]);
+    expect(cdn.log).toEqual([`GET ${GONE_403}`, `GET ${LIVE}`]);
     expect(lines).toEqual([line('outcome=reupload_requested'), line('outcome=reupload_ok')]);
   });
 

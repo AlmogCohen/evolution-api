@@ -816,7 +816,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return webMessageInfo[0].message;
     } catch {
-      return { conversation: '' };
+      // A failed lookup is a miss too: any truthy answer here is relayed as the message.
+      this.logger.warn('getMessage: the message lookup failed, answering nothing');
+      return undefined;
     }
   }
 

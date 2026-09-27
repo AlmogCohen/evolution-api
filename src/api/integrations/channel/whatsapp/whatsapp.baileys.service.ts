@@ -268,11 +268,33 @@ const reuploadRefusal = (error: any): string => {
 };
 
 /**
- * A CDN answer that means the file has expired there, and only the phone still has it.
- * 403 is empirical: history-sync media 30 to 180 days old answered 403 on a real linked
- * phone (2026-09-27), where 24-day-old media answered 410.
+ * When a WhatsApp media link stops working, in unix seconds: its `oe` query parameter
+ * (hex), read from the url, else from the directPath. Undefined when neither has one.
  */
-const isExpiredMedia = (error: any) => [403, 404, 410].includes(httpStatus(error));
+const mediaLinkExpiry = (
+  media: { url?: string | null; directPath?: string | null } | undefined,
+): number | undefined => {
+  for (const link of [media?.url, media?.directPath]) {
+    const oe = link?.match(/[?&]oe=([0-9a-fA-F]+)(?:&|#|$)/)?.[1];
+    if (oe) return parseInt(oe, 16);
+  }
+  return undefined;
+};
+
+/**
+ * A CDN answer that means the file has expired there, and only the phone still has it:
+ * 404 or 410, or 403 on a link whose `oe` has passed. Measured on WhatsApp's media CDN
+ * (2026-09-27, 84 history-sync attachments): 403 on 34 of 34 links whose `oe` had
+ * passed and on 0 of 50 valid ones, where a valid link to a dropped file answered 404
+ * or 410. So a 403 means the signed link expired; on a valid link it is not an expiry.
+ */
+const isExpiredMedia = (error: any, media: Parameters<typeof mediaLinkExpiry>[0]) => {
+  const status = httpStatus(error);
+  if (status === 404 || status === 410) return true;
+  if (status !== 403) return false;
+  const expiry = mediaLinkExpiry(media);
+  return expiry !== undefined && expiry * 1000 <= Date.now();
+};
 
 /**
  * How long the phone gets to answer a re-upload request. Baileys' updateMediaMessage
@@ -4549,7 +4571,8 @@ export class BaileysStartupService extends ChannelStartupService {
           }, MEDIA_REUPLOAD_TIMEOUT_MS);
         });
         try {
-          const ask = async () => this.client.updateMediaMessage({ ...message, key: await this.originalMessageKey(message.key) });
+          const ask = async () =>
+            this.client.updateMediaMessage({ ...message, key: await this.originalMessageKey(message.key) });
           const updated = await Promise.race([ask(), timeout]);
           reupload = 'ok';
           this.logger.warn(`media download: ${media}, outcome=reupload_ok`);
@@ -4566,6 +4589,8 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       };
       const target: WAMessage = { key: msg?.key, message: msg?.message };
+      // The link as first downloaded, whose `oe` says whether a 403 is an expired link.
+      const link = { url: msg.message[mediaType]?.url, directPath: msg.message[mediaType]?.directPath };
       // No reuploadRequest for Baileys: Evolution asks the phone itself, below. Baileys
       // means to ask on a 404 or 410, but 7.0.0-rc14 checks error.status
       // (lib/Utils/messages.js:836) while its CDN fetch sets only output.statusCode
@@ -4578,7 +4603,7 @@ export class BaileysStartupService extends ChannelStartupService {
         try {
           buffer = await download(target);
         } catch (error) {
-          if (!askPhone || !isExpiredMedia(error)) throw error;
+          if (!askPhone || !isExpiredMedia(error, link)) throw error;
           let refreshed: WAMessage;
           try {
             refreshed = await reuploadRequest(target);
@@ -4591,7 +4616,7 @@ export class BaileysStartupService extends ChannelStartupService {
       } catch (error) {
         const status = httpStatus(error);
         this.logger.error(`media download: ${media}, outcome=download_failed, status=${status}, reupload=${reupload}`);
-        if (!askPhone && isExpiredMedia(error)) {
+        if (!askPhone && isExpiredMedia(error, link)) {
           throw `The media is no longer on WhatsApp's servers (HTTP ${status}), and no re-upload from the phone was attempted (reupload: false)`;
         }
         this.logger.error('Download Media failed, trying to retry in 5 seconds...');

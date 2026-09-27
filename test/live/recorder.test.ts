@@ -110,11 +110,11 @@ describe('live-check recorder', () => {
       ['call', false],
     ]);
     expect(emits.every((e) => e.socket === 1 && e.origin === undefined)).toBe(true);
-    // The batches the buffer handed Evolution: the two buffered events arrived as one.
+    // The batches the buffer handed Evolution: the two buffered events arrived as one, in the buffer's key order.
     expect(events.filter((e) => e.batch).map((e) => e.batch)).toEqual([
       ['connection.update'],
       ['creds.update'],
-      ['contacts.upsert', 'messages.upsert'],
+      ['messages.upsert', 'contacts.upsert'],
       ['call'],
     ]);
 

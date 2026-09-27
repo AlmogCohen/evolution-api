@@ -86,6 +86,7 @@ import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { errorFields, jidKind, makeBaileysLogger } from '@utils/log-privacy';
 import { readLogoutMarker, writeLogoutMarker } from '@utils/logout-marker';
+import { LiveRecorder } from '@utils/live-record/recorder';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { QueryLimiter } from '@utils/queryLimiter';
@@ -348,6 +349,8 @@ export class BaileysStartupService extends ChannelStartupService {
   private logout: { marked: boolean; deleted: boolean; settle: (outcome: 'done' | 'pending') => void } | null = null;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  // Records this session's events and webhooks for a live check; undefined unless LIVE_RECORD_DIR is set.
+  private liveRecorder?: LiveRecorder;
   // The dispatcher media downloads go through: the instance's proxy, the same exit as the socket.
   private mediaProxy?: { key: string; dispatcher: ReturnType<typeof makeProxyAgentUndici> };
 
@@ -591,6 +594,7 @@ export class BaileysStartupService extends ChannelStartupService {
     extra?: Record<string, any>,
   ) {
     if (this.logout) return;
+    this.liveRecorder?.webhook(event, data, extra);
     return super.sendDataWebhook(event, data, local, integration, extra);
   }
 
@@ -1050,6 +1054,16 @@ export class BaileysStartupService extends ChannelStartupService {
     this.client = makeWASocket(socketConfig);
     // Any reconnect still waiting was for the socket just replaced.
     this.stopReconnecting();
+
+    this.liveRecorder ??= LiveRecorder.start(this.instance.name);
+    const creds = this.instance.authState.state.creds;
+    this.liveRecorder?.attach(this.client, {
+      waWebVersion: version.join('.'),
+      // creds.account is set once a pairing succeeded.
+      linkMethod: creds?.account ? 'existing-session' : this.phoneNumber ? 'code' : 'qr',
+      proxyProtocol: options ? (this.localProxy?.protocol ?? 'http') : null,
+      creds: () => this.instance.authState?.state?.creds,
+    });
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
@@ -2409,7 +2423,9 @@ export class BaileysStartupService extends ChannelStartupService {
                 }
                 const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
 
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                const upsert = () => this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                if (this.liveRecorder) this.liveRecorder.fromApp(upsert);
+                else upsert();
               }
 
               this.sendDataWebhook(Events.CALL, call);

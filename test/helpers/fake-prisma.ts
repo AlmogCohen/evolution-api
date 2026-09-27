@@ -76,6 +76,7 @@ export function fakePrisma() {
     label: table('label', () => undefined),
     isOnWhatsapp: table('isOnWhatsapp', (r) => r.remoteJid),
     instance: table('instance', (r) => r.id),
+    proxy: table('proxy', (r) => r.instanceId),
   };
   db.$transaction = async (ops: any) => (typeof ops === 'function' ? ops(db) : Promise.all(ops));
   db.$queryRaw = async () => [];

@@ -16,7 +16,9 @@ for (let i = 0; i < args.length; i++) {
 }
 const [rawDir, checkId] = positional;
 if (!rawDir || !checkId) {
-  console.error('usage: npx tsx scripts/live-scrub.ts <raw session dir> <check-id> [--date YYYY-MM-DD] [--phone-model ...] [--os-version ...] [--wa-version ...] [--country-code ...] [--out dir]');
+  console.error(
+    'usage: npx tsx scripts/live-scrub.ts <raw session dir> <check-id> [--date YYYY-MM-DD] [--phone-model ...] [--os-version ...] [--wa-version ...] [--country-code ...] [--out dir]',
+  );
   process.exit(2);
 }
 

@@ -40,7 +40,10 @@ export function encode(value: any): any {
 }
 
 const protoClass = (name: string) => {
-  const Ctor = name.split('.').slice(1).reduce((node: any, part) => node?.[part], proto);
+  const Ctor = name
+    .split('.')
+    .slice(1)
+    .reduce((node: any, part) => node?.[part], proto);
   if (typeof Ctor !== 'function') throw new Error(`live-record: unknown protobuf class ${name}`);
   return Ctor;
 };

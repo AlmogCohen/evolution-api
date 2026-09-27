@@ -39,20 +39,23 @@ const JID = /^(\d+(?:-\d+)?)((?:[:_]\d+)*)@(s\.whatsapp\.net|c\.us|hosted|lid|ho
 const PN_SERVERS = new Set(['s.whatsapp.net', 'c.us', 'hosted']);
 const LID_SERVERS = new Set(['lid', 'hosted.lid']);
 
-const NAME_KEYS = new Set([
-  'name', 'notify', 'verifiedName', 'verifiedBizName', 'pushName', 'username', 'subject', 'profileName',
-  'fullName', 'firstName', 'shortName', 'displayName', 'vname',
-]);
-const TEXT_KEYS = new Set([
-  'conversation', 'text', 'caption', 'desc', 'description', 'title', 'body', 'matchedText', 'canonicalUrl',
-  'fileName', 'address', 'contentText', 'footerText', 'headerText', 'vcard', 'selectedDisplayText', 'optionName',
-  'comment', 'message', 'msgCall',
-]);
-const ID_KEYS = new Set(['id', 'stanzaId', 'keyId', 'messageId', 'callId']);
-const STRUCTURAL_KEYS = new Set([
-  '$proto', '$redacted', 'as', 'event', 'type', 'messageType', 'mimetype', 'addressingMode', 'action', 'connection',
-  'source', 'origin', 'state', 'status', 'platform', 'mediaType',
-]);
+/** Key lists, one word per key. */
+const words = (list: string) => new Set(list.trim().split(/\s+/));
+const NAME_KEYS = words(`
+  name notify verifiedName verifiedBizName pushName username subject profileName fullName
+  firstName shortName displayName vname
+`);
+const TEXT_KEYS = words(`
+  conversation text caption desc description title body matchedText canonicalUrl fileName address
+  contentText footerText headerText vcard selectedDisplayText optionName comment message msgCall
+`);
+const ID_KEYS = words(`
+  id stanzaId keyId messageId callId
+`);
+const STRUCTURAL_KEYS = words(`
+  $proto $redacted as event type messageType mimetype addressingMode action connection source
+  origin state status platform mediaType
+`);
 
 const isEpoch = (digits: string) => /^1\d{9}$/.test(digits) || /^1\d{12}$/.test(digits);
 const isStructural = (key: string, s: string) =>
@@ -211,7 +214,10 @@ class Scrubber {
 
   private fakeId(s: string) {
     return this.memo(this.ids, s, (n) => {
-      const body = n.toString(16).toUpperCase().padStart(s.length - 2, 'F');
+      const body = n
+        .toString(16)
+        .toUpperCase()
+        .padStart(s.length - 2, 'F');
       const id = s.slice(0, 2) + body.slice(-(s.length - 2));
       return s === s.toLowerCase() ? id.toLowerCase() : id;
     });

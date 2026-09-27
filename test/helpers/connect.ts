@@ -17,6 +17,15 @@ export function fakeSocket() {
   };
 }
 
+/** The auth state is files on disk under the instances directory; nothing about it touches the network. */
+export function stubAuthState(service: any) {
+  service.defineAuthState = async () => ({
+    state: { creds: initAuthCreds(), keys: { get: async () => ({}), set: async () => undefined } },
+    saveCreds: async () => undefined,
+    removeCreds: async () => undefined,
+  });
+}
+
 export type ProxyProtocol = 'http' | 'socks5';
 
 /** Set the proxy the way /proxy/set does, then connect the way Evolution does. Returns the socket config. */
@@ -32,12 +41,7 @@ export async function connectBehind(socketSpy: { mock: { calls: any[][] } }, pro
       password: '',
     });
   }
-  // The auth state is files on disk under the instances directory; nothing about it touches the network.
-  service.defineAuthState = async () => ({
-    state: { creds: initAuthCreds(), keys: { get: async () => ({}), set: async () => undefined } },
-    saveCreds: async () => undefined,
-    removeCreds: async () => undefined,
-  });
+  stubAuthState(service);
   const before = socketSpy.mock.calls.length;
   await service.connectToWhatsapp();
   const config = socketSpy.mock.calls[before]?.[0];

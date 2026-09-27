@@ -813,7 +813,12 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private readonly contactHandle = {
-    'contacts.upsert': async (contacts: Contact[]) => {
+    // `saved` on each contacts.upsert item says the name is certainly the one the
+    // owner saved in their address book. In Baileys only an app-state contact
+    // action emits contacts.upsert, with name = fullName || firstName || username,
+    // so a name equal to the username is a handle, not a saved name. Callers that
+    // cannot be sure (history) pass saved: false.
+    'contacts.upsert': async (contacts: (Contact & { saved?: boolean })[]) => {
       try {
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
@@ -823,7 +828,13 @@ export class BaileysStartupService extends ChannelStartupService {
         }));
 
         if (contactsRaw.length > 0) {
-          this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
+          this.sendDataWebhook(
+            Events.CONTACTS_UPSERT,
+            contactsRaw.map((raw, i) => ({
+              ...raw,
+              saved: contacts[i].saved ?? (!!contacts[i].name && contacts[i].name !== contacts[i].username),
+            })),
+          );
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
             await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
@@ -1125,7 +1136,10 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         await this.contactHandle['contacts.upsert'](
-          contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+          contacts
+            .filter((c) => !!c.notify || !!c.name)
+            // A history name is displayName || name || username, and a push name is the profile name.
+            .map((c) => ({ id: c.id, name: c.name ?? c.notify, saved: false })),
         );
 
         contacts = undefined;
@@ -1598,7 +1612,8 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
-          this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
+          // A message's pushName is the sender's own profile name, never a saved one.
+          this.sendDataWebhook(Events.CONTACTS_UPSERT, { ...contactRaw, saved: false });
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
             await this.prismaRepository.contact.upsert({

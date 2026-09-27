@@ -237,6 +237,16 @@ type MediaReupload = 'not_requested' | 'ok' | 'failed';
 /** The HTTP status a Baileys media error carries (a Boom's output.statusCode), or 'none'. */
 const httpStatus = (error: any) => error?.output?.statusCode ?? error?.status ?? 'none';
 
+/** A CDN answer that means the file has expired there, and only the phone still has it. */
+const isExpiredMedia = (error: any) => [404, 410].includes(httpStatus(error));
+
+/**
+ * How long the phone gets to answer a re-upload request. Baileys' updateMediaMessage
+ * waits for the answer with no timeout of its own, so this is its default query
+ * timeout (defaultQueryTimeoutMs).
+ */
+export const MEDIA_REUPLOAD_TIMEOUT_MS = 60_000;
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -4451,10 +4461,18 @@ export class BaileysStartupService extends ChannelStartupService {
       // reupload: false downloads only what is still on WhatsApp's servers.
       const askPhone = data?.reupload !== false;
       reupload = 'not_requested';
-      const reuploadRequest = async (message: WAMessage) => {
+      // Asks the phone for a new copy, for a bounded time. Called at most once per download.
+      const reuploadRequest = async (message: WAMessage): Promise<WAMessage> => {
         this.logger.warn(`media download: ${media}, outcome=reupload_requested`);
+        let timer: NodeJS.Timeout;
+        const timeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error(`the phone did not answer the re-upload request in ${MEDIA_REUPLOAD_TIMEOUT_MS}ms`);
+            reject(Object.assign(error, { name: 'ReuploadTimeoutError' }));
+          }, MEDIA_REUPLOAD_TIMEOUT_MS);
+        });
         try {
-          const updated = await this.client.updateMediaMessage(message);
+          const updated = await Promise.race([this.client.updateMediaMessage(message), timeout]);
           reupload = 'ok';
           this.logger.warn(`media download: ${media}, outcome=reupload_ok`);
           return updated;
@@ -4464,16 +4482,33 @@ export class BaileysStartupService extends ChannelStartupService {
             `media download: ${media}, outcome=reupload_failed, error=${error?.name ?? 'unknown'}, status=${httpStatus(error)}`,
           );
           throw error;
+        } finally {
+          clearTimeout(timer);
         }
       };
+      const target: WAMessage = { key: msg?.key, message: msg?.message };
+      // No reuploadRequest for Baileys: Evolution asks the phone itself, below. Baileys
+      // means to ask on a 404 or 410, but 7.0.0-rc14 checks error.status
+      // (lib/Utils/messages.js:836) while its CDN fetch sets only output.statusCode
+      // (lib/Utils/messages-media.js:304), so it never does. Handing it the request as
+      // well would let a Baileys that does ask make a second one.
+      const download = (message: WAMessage) =>
+        downloadMediaMessage(message, 'buffer', this.mediaDownloadOptions()) as Promise<Buffer>;
 
       try {
-        buffer = await downloadMediaMessage(
-          { key: msg?.key, message: msg?.message },
-          'buffer',
-          this.mediaDownloadOptions(),
-          askPhone ? { logger: makeBaileysLogger('error') as any, reuploadRequest } : undefined,
-        );
+        try {
+          buffer = await download(target);
+        } catch (error) {
+          if (!askPhone || !isExpiredMedia(error)) throw error;
+          let refreshed: WAMessage;
+          try {
+            refreshed = await reuploadRequest(target);
+          } catch {
+            // The download's own error stands; the log already says how the re-upload ended.
+            throw error;
+          }
+          buffer = await download(refreshed);
+        }
       } catch (error) {
         const status = httpStatus(error);
         this.logger.error(`media download: ${media}, outcome=download_failed, status=${status}, reupload=${reupload}`);

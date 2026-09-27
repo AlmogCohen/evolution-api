@@ -51,7 +51,7 @@ named where one exists.
 **Messages and privacy**
 - A `getMessage` miss or failed lookup answers nothing, so Baileys no longer relays an empty message on a retry and uses it up (#2705, and #2706 for groups; fixes also offered in #2728 and #2623).
 - No message text, phone number, JID or push name reaches the logs at `LOG_LEVEL=ERROR,WARN`, including Baileys' own error logs.
-- A media download records whether it asked the phone to re-upload an expired file and how that ended (a bounded log line, and `reupload` on the download's error). Baileys 7.0.0-rc14 never asks on a CDN 404 or 410, and the record says so.
+- A media download records whether it asked the phone to re-upload an expired file and how that ended (a bounded log line, and `reupload` on the download's error). Baileys 7.0.0-rc14 never asks on a CDN 404 or 410 (its check misses the status), so Evolution asks the phone itself, once per download, for at most 60s.
 - `POST /chat/getBase64FromMediaMessage` takes an optional `reupload` (boolean, default true). With `false` the phone is never asked to re-upload, and a file gone from the CDN fails at once with a 400 that says so; the HTTP error carries `reupload` for any failed download.
 
 **Proxy**

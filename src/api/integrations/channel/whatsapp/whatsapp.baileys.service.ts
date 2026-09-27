@@ -4401,6 +4401,41 @@ export class BaileysStartupService extends ChannelStartupService {
     return { options: { dispatcher: this.mediaProxy.dispatcher } as RequestInit };
   }
 
+  /**
+   * The key the phone stores a message under, which is how a request about the message
+   * (a media re-upload) must name it: the phone refuses one that names a DM it keeps
+   * under an @lid by the phone JID. The messages.upsert webhook shows such a DM under
+   * the phone JID with the @lid in remoteJidAlt; a key from Evolution 2.3.7 has the phone
+   * twice and addressingMode 'lid', and only Baileys' LID mapping still knows the @lid.
+   * A group key names its sender the same way, in participant / participantAlt.
+   */
+  private async originalMessageKey(key: WAMessageKey): Promise<WAMessageKey> {
+    if (!key) return key;
+    const original = { ...key };
+    if (!isLidUser(key.remoteJid) && isLidUser(key.remoteJidAlt)) {
+      original.remoteJid = key.remoteJidAlt;
+      original.remoteJidAlt = key.remoteJid;
+      original.addressingMode = 'lid';
+    } else if (key.addressingMode === 'lid' && isPnUser(key.remoteJid)) {
+      let lid: string | null = null;
+      try {
+        lid = await this.client.signalRepository?.lidMapping?.getLIDForPN(key.remoteJid);
+      } catch {
+        // No mapping: the key is asked for as it was given.
+      }
+      if (isLidUser(lid)) {
+        original.remoteJid = lid;
+        original.remoteJidAlt = key.remoteJid;
+      }
+    }
+    if (!isLidUser(key.participant) && isLidUser(key.participantAlt)) {
+      original.participant = key.participantAlt;
+      original.participantAlt = key.participant;
+      original.addressingMode = 'lid';
+    }
+    return original;
+  }
+
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
     // Set once a download is attempted: whether the phone was asked to re-upload an expired file.
     let reupload: MediaReupload | undefined;
@@ -4478,7 +4513,8 @@ export class BaileysStartupService extends ChannelStartupService {
           }, MEDIA_REUPLOAD_TIMEOUT_MS);
         });
         try {
-          const updated = await Promise.race([this.client.updateMediaMessage(message), timeout]);
+          const ask = async () => this.client.updateMediaMessage({ ...message, key: await this.originalMessageKey(message.key) });
+          const updated = await Promise.race([ask(), timeout]);
           reupload = 'ok';
           this.logger.warn(`media download: ${media}, outcome=reupload_ok`);
           return updated;

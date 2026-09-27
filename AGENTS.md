@@ -1,3 +1,44 @@
+# Working in this fork (read first)
+
+This is an unofficial fork of Evolution API 2.3.7 (`FORK.md`).
+These rules are this fork's own standard. They are not Evolution's, and they
+do not go into pull requests offered to evolution-foundation/evolution-api.
+
+## Test first, always: red, then green
+
+1. Write the test that reproduces the bug or specifies the behaviour, and run
+   it against the code as it is. It must FAIL, for the reason the bug gives.
+   A test that passes before the fix proves nothing: rewrite it.
+2. Commit the test alone: `test: <what it proves>`. CI runs on that commit,
+   and its red run is the evidence.
+3. Make the smallest change that turns it green, with the rest of the suite
+   still green, and commit it: `fix: ...` or `feat: ...`. Push the two commits
+   one at a time, so CI records each.
+
+Never change a test to make it pass, and never skip or delete a failing test
+without saying why in the commit.
+
+## How the tests run
+
+- `npm test` runs vitest over `test/**/*.test.ts`. The tests run Evolution's
+  TypeScript source, not the bundle, against the Baileys that `package.json`
+  pins (`BAILEYS_DIR` points them at another build).
+- A fixture is a WhatsApp-side input (a `HistorySync` proto, an app-state
+  action, an encrypted patch), turned into events by the Baileys version under
+  test. Hand-written events are allowed only where Baileys has no builder.
+- `test/helpers/baileys-service.ts` builds the real `BaileysStartupService`
+  with an in-memory Prisma and the real Baileys event buffer; `deliver()`
+  sends a batch the way the socket does (buffered).
+- Every test runs under a configuration profile (`test/helpers/profiles.ts`).
+  The default is `minimal`, a production configuration that stores only the instance; a test
+  of storage uses `stored`. A behaviour that depends on a flag is tested
+  under both.
+- Assert what a consumer observes: the webhook payload, the stored row, the
+  socket call, the HTTP answer. Assert exact fields, not substrings.
+- No test touches WhatsApp, a real account or the network beyond localhost.
+
+---
+
 # Evolution API - AI Agent Guidelines
 
 This document provides comprehensive guidelines for AI agents (Claude, GPT, Cursor, etc.) working with the Evolution API codebase.

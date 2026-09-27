@@ -736,7 +736,8 @@ export class BaileysStartupService extends ChannelStartupService {
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
     try {
       this.loadChatwoot();
-      this.loadSettings();
+      // The socket takes syncFullHistory, groupsIgnore, readStatus and alwaysOnline as config: read them first.
+      await this.loadSettings();
       this.loadWebhook();
       // The socket, the version fetch and media all take their exit from localProxy: read it before connecting.
       await this.loadProxy();

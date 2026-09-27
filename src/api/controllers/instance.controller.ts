@@ -457,7 +457,15 @@ export class InstanceController {
     const { instance } = await this.connectionState({ instanceName });
     const waInstance = this.waMonitor.waInstances[instanceName];
 
-    if (waInstance?.logoutPending) return LOGOUT_PENDING;
+    // Already pending: answered 202 only once it is recorded (logoutInstance tries again if it was not).
+    if (waInstance?.logoutPending) {
+      try {
+        await waInstance.logoutInstance();
+      } catch (error) {
+        throw new InternalServerErrorException(error.toString());
+      }
+      return LOGOUT_PENDING;
+    }
 
     // "close" is also an instance whose socket dropped and whose linked session is still stored
     // (a reconnect waiting): that one is logged out, or its reconnect brings the session back.
@@ -488,6 +496,8 @@ export class InstanceController {
         try {
           pending = (await this.logout({ instanceName }))?.status === 'PENDING';
         } catch (error) {
+          // Pending but not recorded: deleting now would wipe the creds the logout needs.
+          if (waInstances?.logoutPending) throw error;
           // A failed logout must not stop the delete. The remove.instance emit
           // below is the only path that purges the in-memory entry and runs
           // cleaningUp() and cleaningStoreData(), which wipe the session again.
@@ -520,6 +530,11 @@ export class InstanceController {
       this.eventEmitter.emit('remove.instance', instanceName, 'inner');
       return { status: 'SUCCESS', error: false, response: { message: 'Instance deleted' } };
     } catch (error) {
+      if (error instanceof InternalServerErrorException) throw error;
+      // A pending logout that could not be recorded as deleted: the instance stays, and so does its logout.
+      if (this.waMonitor.waInstances[instanceName]?.logoutPending) {
+        throw new InternalServerErrorException(error.toString());
+      }
       throw new BadRequestException(error.toString());
     }
   }

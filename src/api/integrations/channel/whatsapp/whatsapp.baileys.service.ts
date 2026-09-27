@@ -80,7 +80,7 @@ import { BadRequestException, InternalServerErrorException, NotFoundException } 
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
-import { Instance, Message } from '@prisma/client';
+import { Instance, Message, Prisma } from '@prisma/client';
 import { chatState } from '@utils/chat-state';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
@@ -322,6 +322,20 @@ const isExpiredMedia = (error: any, media: { url?: string | null; directPath?: s
  */
 export const MEDIA_REUPLOAD_TIMEOUT_MS = 60_000;
 
+/** The pending logout recordPending wrote on an instance's row (disconnectionObject), if there is one. */
+const pendingOnRow = (value: unknown): { deleted: boolean } | undefined => {
+  let object: any = value;
+  if (typeof object === 'string') {
+    try {
+      object = JSON.parse(object);
+    } catch {
+      return undefined;
+    }
+  }
+  const pending = object?.logoutPending;
+  return pending && typeof pending === 'object' ? { deleted: !!pending.deleted } : undefined;
+};
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -358,9 +372,16 @@ export class BaileysStartupService extends ChannelStartupService {
   // Stops Evolution listening to the current socket; called before that socket is ended.
   private detachClient?: () => void;
   // A logout under way. Until it is done the instance forwards and stores nothing, and it connects
-  // only to tell WhatsApp. `marked`: it could not reach WhatsApp, so it is pending, with a marker
-  // (utils/logout-marker.ts) that survives a restart. `deleted`: the instance has left the API.
-  private logout: { marked: boolean; deleted: boolean; settle: (outcome: 'done' | 'pending') => void } | null = null;
+  // only to tell WhatsApp. `marked`: it could not reach WhatsApp, so it is pending, recorded on the
+  // instance's row (`recorded`, what a 202 promises: it survives a restart and the loss of the
+  // instances volume) and in a marker file (utils/logout-marker.ts). `deleted`: the instance has
+  // left the API.
+  private logout: {
+    marked: boolean;
+    deleted: boolean;
+    recorded?: boolean;
+    settle: (outcome: 'done' | 'pending') => void;
+  } | null = null;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   // Records this session's events and webhooks for a live check; undefined unless LIVE_RECORD_DIR is set.
@@ -406,7 +427,10 @@ export class BaileysStartupService extends ChannelStartupService {
   public async logoutInstance(): Promise<'done' | 'pending'> {
     // A connect under way finishes first, so the socket logged out is the one it builds.
     await this.connecting?.socket.catch(() => undefined);
-    if (this.logout?.marked) return 'pending';
+    if (this.logout?.marked) {
+      await this.recordPending();
+      return 'pending';
+    }
     if (this.logout) return 'done';
 
     const linked = await this.hasLinkedSession();
@@ -443,8 +467,10 @@ export class BaileysStartupService extends ChannelStartupService {
     const late = new Promise<'late'>((r) => (timer = setTimeout(() => r('late'), 10_000)));
     const result = await Promise.race([outcome, late]);
     clearTimeout(timer);
-    if (result === 'late') {
-      await this.markLogoutPending();
+    if (result === 'late') await this.markLogoutPending();
+    // A 202 promises the logout survives a restart: when that cannot be recorded, the caller hears it.
+    if (result === 'late' || result === 'pending') {
+      await this.recordPending();
       return 'pending';
     }
     return result;
@@ -455,18 +481,45 @@ export class BaileysStartupService extends ChannelStartupService {
     return !!this.logout?.marked;
   }
 
-  /** The instance was deleted while its logout is pending: it finishes out of the API, then removes the rest. */
+  /**
+   * The instance was deleted while its logout is pending: it finishes out of the API, then removes
+   * the rest. Throws, changing nothing, when that cannot be recorded on its row.
+   */
   public async markLogoutDeleted() {
     if (!this.logout) return;
     this.logout.deleted = true;
+    this.logout.recorded = false;
+    try {
+      await this.recordPending();
+    } catch (error) {
+      this.logout.deleted = false;
+      this.logout.recorded = false;
+      throw error;
+    }
     await this.writeMarker();
   }
 
-  /** On boot: an instance with a logout marker connects only to finish its logout. Returns whether it had one. */
-  public async resumePendingLogout(): Promise<boolean> {
+  /**
+   * A logout that was pending when the process stopped: from the marker file, else from the row
+   * (the instances volume can be lost; the row and the creds are in the database).
+   */
+  public async pendingLogout(): Promise<{ deleted: boolean } | undefined> {
     const marker = readLogoutMarker(this.instanceId);
-    if (!marker) return false;
-    this.logout = { marked: true, deleted: !!marker.deleted, settle: () => undefined };
+    if (marker) return { deleted: !!marker.deleted };
+    try {
+      const row = await this.prismaRepository.instance.findUnique({ where: { id: this.instanceId } });
+      return pendingOnRow(row?.disconnectionObject);
+    } catch (error) {
+      this.logger.error({ message: 'Could not read whether a logout is pending', error: errorFields(error) });
+      return undefined;
+    }
+  }
+
+  /** On boot: an instance with a pending logout connects only to finish it. Returns whether it had one. */
+  public async resumePendingLogout(pending?: { deleted: boolean }): Promise<boolean> {
+    pending ??= await this.pendingLogout();
+    if (!pending) return false;
+    this.logout = { marked: true, deleted: pending.deleted, recorded: true, settle: () => undefined };
     this.logger.info(`Resuming a pending logout for instance "${this.instance.name}"`);
     try {
       await this.connect(this.phoneNumber);
@@ -516,18 +569,34 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * Record the pending logout on the instance's row, where the boot finds it even without the
+   * marker file, and where the creds it needs are. Throws when it cannot: a 202 must not promise
+   * what a restart would forget.
+   */
+  private async recordPending() {
+    const logout = this.logout;
+    if (!logout?.marked || logout.recorded) return;
+    await this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: {
+        connectionStatus: 'close',
+        disconnectionAt: new Date(),
+        disconnectionObject: { logoutPending: { deleted: logout.deleted, since: new Date().toISOString() } },
+      },
+    });
+    logout.recorded = true;
+  }
+
   /** The logout could not reach WhatsApp: keep the session, mark it pending, and reconnect to deliver it. */
   private async markLogoutPending() {
     if (!this.logout || this.logout.marked) return;
     this.logout.marked = true;
     await this.writeMarker();
-    // The row too: the boot auto-connects only an open or connecting row, so even if the marker
-    // file is lost the instance does not come back as a normal one (it stays down, creds kept).
-    await this.prismaRepository.instance
-      .update({ where: { id: this.instanceId }, data: { connectionStatus: 'close' } })
-      .catch((error) =>
-        this.logger.error({ message: 'Could not record the pending logout on the row', error: error?.toString() }),
-      );
+    // Still pending in this process if it fails; logoutInstance tries again and tells the caller.
+    await this.recordPending().catch((error) =>
+      this.logger.error({ message: 'Could not record the pending logout on the row', error: errorFields(error) }),
+    );
     this.logout.settle('pending');
     if (!this.reconnectTimer && !this.connecting && this.stateConnection.state === 'close') this.scheduleReconnect();
   }
@@ -570,6 +639,13 @@ export class BaileysStartupService extends ChannelStartupService {
     this.stopReconnecting();
     try {
       await this.removeSession();
+      // Not pending any more: the boot must never resume a logout on a device linked again later.
+      if (!logout.deleted) {
+        await this.prismaRepository.instance.updateMany({
+          where: { id: this.instanceId },
+          data: { disconnectionObject: Prisma.DbNull },
+        });
+      }
       if (logout.deleted) {
         // Out of the API already: remove what was kept for the logout, the row last (it cascades to
         // the rest). Before the marker goes, so a failure here is finished again on the next try.

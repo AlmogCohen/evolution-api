@@ -365,11 +365,11 @@ export class WAMonitoringService {
 
     // A logout that had not reached WhatsApp before the restart: connect only to deliver it. A
     // deleted instance's row is kept until then, and it stays out of the API (finishingLogouts).
-    const marker = readLogoutMarker(instanceData.instanceId);
-    if (marker && (instance as any).resumePendingLogout) {
-      if (marker.deleted) this.finishingLogouts[instanceData.instanceName] = instance;
+    const pending = await (instance as any).pendingLogout?.();
+    if (pending) {
+      if (pending.deleted) this.finishingLogouts[instanceData.instanceName] = instance;
       else this.waInstances[instanceData.instanceName] = instance;
-      await (instance as any).resumePendingLogout();
+      await (instance as any).resumePendingLogout(pending);
       return;
     }
 

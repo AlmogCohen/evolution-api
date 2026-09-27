@@ -337,12 +337,37 @@ describe('a logout that cannot reach WhatsApp', () => {
 
     const sock = await reconnected(1);
     await deliverWhilePending(sock, monitor.waInstances.test);
+    expect(emitted.map((e) => e.event)).toEqual([]);
     await opened(sock);
     await settle(monitor.waInstances.test);
-    expect({ logouts: sock.logouts, me: storedMe(), emitted: emitted.map((e) => e.event) }).toEqual({
+    expect({
+      logouts: sock.logouts,
+      me: storedMe(),
+      loggedOut: emitted.some((e) => e.event === 'logout.instance'),
+    }).toEqual({
       logouts: 1,
       me: [],
-      emitted: [],
+      loggedOut: true,
+    });
+  });
+
+  // What the row records must go when the logout is delivered, or a later boot would log out a
+  // device linked again since.
+  it('once delivered, is not resumed by the next boot', async () => {
+    const { service } = await waitingToReconnect();
+    expect(await call('DELETE', 'logout')).toEqual(PENDING);
+    const sock = await reconnected(2);
+    await opened(sock);
+    await settle(service);
+    expect(sock.logouts).toBe(1);
+    socketSpy.mockClear();
+
+    const monitor = await startProcess();
+    await vi.waitFor(() => expect(monitor.waInstances.test).toBeDefined());
+    await new Promise((r) => setTimeout(r, 1_200));
+    expect({ sockets: built().length, pending: monitor.waInstances.test.logoutPending }).toEqual({
+      sockets: 0,
+      pending: false,
     });
   });
 
@@ -362,8 +387,9 @@ describe('a logout that cannot reach WhatsApp', () => {
       body: JSON.stringify({ instanceName: 'test', integration: 'WHATSAPP-BAILEYS' }),
     });
     expect({ listed: !!monitor.waInstances.test, create: create.status }).toEqual({ listed: false, create: 403 });
+    const finishing = monitor.finishingLogouts.test;
     await opened(sock);
-    await settle(monitor.finishingLogouts.test);
+    await settle(finishing);
     expect({ logouts: sock.logouts, me: storedMe(), instances: prisma.instance.rows.length }).toEqual({
       logouts: 1,
       me: [],

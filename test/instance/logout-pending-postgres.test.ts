@@ -341,8 +341,9 @@ describe('deleting an instance whose logout cannot reach WhatsApp (real Postgres
     const sock = await reconnected(1);
     expect(monitor.waInstances.test).toBeUndefined();
     await hiddenFromTheApi();
+    const finishing = monitor.finishingLogouts.test;
     await opened(sock);
-    await settle(monitor.finishingLogouts.test);
+    await settle(finishing);
     expect({ logouts: sock.logouts, rows: await rows() }).toEqual({
       logouts: 1,
       rows: { instances: 0, sessions: 0, proxies: 0, settings: 0 },

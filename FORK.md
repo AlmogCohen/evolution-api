@@ -63,7 +63,7 @@ named where one exists.
 
 **Sessions and connections**
 - A database error never replaces a linked session's credentials with fresh ones, and a failed settings read no longer drops an event batch.
-- A logout or delete while the socket is down keeps the session until WhatsApp is told, so the device leaves the phone's Linked devices; it answers `202 PENDING` meanwhile and forwards nothing (#2520, #2508 in part). A deleted instance keeps its database row until then (Session and Proxy cascade from it), out of the API, its name taken and its token cleared.
+- A logout or delete while the socket is down keeps the session until WhatsApp is told, so the device leaves the phone's Linked devices; it answers `202 PENDING` meanwhile and forwards nothing (#2520, #2508 in part). The pending logout is recorded on the instance's row (`disconnectionObject.logoutPending`) as well as in a file next to the session keys, so a restart that lost the instances volume still finishes it; when it cannot be recorded, the logout or delete answers 500 instead of 202. A deleted instance keeps its database row until then (Session and Proxy cascade from it), out of the API, its name taken and its token cleared.
 - Reconnects back off from 1s to 60s instead of spinning, the version fetch times out after 10s, and an instance never runs two sockets (#2134, #2184, #2430; ideas from #2732).
 - Profile pictures are looked up once per contact per hour, at most four at a time, and history never waits on them (#1883).
 - One pairing code per connect attempt, and a fresh QR budget per attempt (#2100, #2696).

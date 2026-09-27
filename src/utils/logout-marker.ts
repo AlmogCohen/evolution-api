@@ -6,8 +6,10 @@ import { join } from 'path';
 /**
  * A logout that could not reach WhatsApp is kept pending until it does, across restarts. The
  * marker is a file in the instance's directory under INSTANCE_DIR, next to the session's signal
- * key files: no schema change (the fork stays migration-identical to 2.3.7), the same durability
- * as the session it has to log out, and removed by the same rm that wipes those keys.
+ * key files, and removed by the same rm that wipes those keys. It is the second record: the first
+ * is on the instance's row (disconnectionObject.logoutPending, BaileysStartupService.recordPending),
+ * which survives the loss of that directory. No schema change: the fork stays migration-identical
+ * to 2.3.7.
  */
 export type LogoutMarker = { instanceName: string; deleted: boolean; since: string };
 

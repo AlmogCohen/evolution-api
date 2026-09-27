@@ -4448,6 +4448,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
       let buffer: Buffer;
       const media = `message=${msg?.key?.id}, chat=${jidKind(msg?.key?.remoteJid)}`;
+      // reupload: false downloads only what is still on WhatsApp's servers.
+      const askPhone = data?.reupload !== false;
       reupload = 'not_requested';
       const reuploadRequest = async (message: WAMessage) => {
         this.logger.warn(`media download: ${media}, outcome=reupload_requested`);
@@ -4470,12 +4472,14 @@ export class BaileysStartupService extends ChannelStartupService {
           { key: msg?.key, message: msg?.message },
           'buffer',
           this.mediaDownloadOptions(),
-          { logger: makeBaileysLogger('error') as any, reuploadRequest },
+          askPhone ? { logger: makeBaileysLogger('error') as any, reuploadRequest } : undefined,
         );
       } catch (error) {
-        this.logger.error(
-          `media download: ${media}, outcome=download_failed, status=${httpStatus(error)}, reupload=${reupload}`,
-        );
+        const status = httpStatus(error);
+        this.logger.error(`media download: ${media}, outcome=download_failed, status=${status}, reupload=${reupload}`);
+        if (!askPhone && (status === 404 || status === 410)) {
+          throw `The media is no longer on WhatsApp's servers (HTTP ${status}), and no re-upload from the phone was attempted (reupload: false)`;
+        }
         this.logger.error('Download Media failed, trying to retry in 5 seconds...');
         await new Promise((resolve) => setTimeout(resolve, 5000));
         const mediaType = Object.keys(msg.message).find((key) => key.endsWith('Message'));

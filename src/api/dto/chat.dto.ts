@@ -20,6 +20,8 @@ export class OnWhatsAppDto {
 export class getBase64FromMediaMessageDto {
   message: proto.WebMessageInfo;
   convertToMp4?: boolean;
+  /** false: never ask the phone to re-upload a file that has expired on the CDN (default true). */
+  reupload?: boolean;
 }
 
 export class WhatsAppNumberDto {

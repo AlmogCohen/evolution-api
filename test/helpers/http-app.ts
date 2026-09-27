@@ -10,7 +10,11 @@ async function serve(mount: string, router: any) {
   app.use(express.json({ limit: '10mb' }));
   app.use(mount, router);
   app.use((err: any, _req: any, res: any, _next: any) =>
-    res.status(err?.status || 500).json({ status: err?.status || 500, error: err?.error, response: { message: err?.message } }),
+    res.status(err?.status || 500).json({
+      status: err?.status || 500,
+      error: err?.error,
+      response: { message: err?.message, ...(err?.reupload !== undefined && { reupload: err.reupload }) },
+    }),
   );
   const server = app.listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));

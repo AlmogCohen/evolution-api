@@ -24,6 +24,7 @@ import {
   blockUserSchema,
   contactValidateSchema,
   deleteMessageSchema,
+  getBase64FromMediaMessageSchema,
   markChatUnreadSchema,
   messageUpSchema,
   messageValidateSchema,
@@ -113,7 +114,7 @@ export class ChatRouter extends RouterBroker {
       .post(this.routerPath('getBase64FromMediaMessage'), ...guards, async (req, res) => {
         const response = await this.dataValidate<getBase64FromMediaMessageDto>({
           request: req,
-          schema: null,
+          schema: getBase64FromMediaMessageSchema,
           ClassRef: getBase64FromMediaMessageDto,
           execute: (instance, data) => chatController.getBase64FromMediaMessage(instance, data),
         });

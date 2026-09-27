@@ -613,38 +613,36 @@ export class BaileysStartupService extends ChannelStartupService {
     if (this.localProxy?.enabled) {
       this.logger.info('Proxy enabled: ' + this.localProxy?.host);
 
+      let proxy: Parameters<typeof makeProxyAgent>[0];
+
       if (this.localProxy?.host?.includes('proxyscrape')) {
         try {
           const response = await axios.get(this.localProxy?.host);
           const text = response.data;
           const proxyUrls = text.split('\r\n');
           const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
-          const proxyUrl = 'http://' + proxyUrls[rand];
-          options = { agent: makeProxyAgent(proxyUrl), fetchAgent: makeProxyAgentUndici(proxyUrl) };
+          proxy = 'http://' + proxyUrls[rand];
         } catch {
           this.localProxy.enabled = false;
         }
       } else {
-        options = {
-          agent: makeProxyAgent({
-            host: this.localProxy.host,
-            port: this.localProxy.port,
-            protocol: this.localProxy.protocol,
-            username: this.localProxy.username,
-            password: this.localProxy.password,
-          }),
-          fetchAgent: makeProxyAgentUndici({
-            host: this.localProxy.host,
-            port: this.localProxy.port,
-            protocol: this.localProxy.protocol,
-            username: this.localProxy.username,
-            password: this.localProxy.password,
-          }),
+        proxy = {
+          host: this.localProxy.host,
+          port: this.localProxy.port,
+          protocol: this.localProxy.protocol,
+          username: this.localProxy.username,
+          password: this.localProxy.password,
         };
       }
-    }
 
-    if (options?.fetchAgent) this.mediaProxy = { key: this.proxyKey(), dispatcher: options.fetchAgent };
+      if (proxy) {
+        // Baileys uploads with http.request under Node, which takes an http agent
+        // (fetchAgent), not an undici dispatcher. Downloads use fetch, which takes
+        // only a dispatcher: see mediaDownloadOptions. All three share one exit.
+        options = { agent: makeProxyAgent(proxy), fetchAgent: makeProxyAgent(proxy) };
+        this.mediaProxy = { key: this.proxyKey(), dispatcher: makeProxyAgentUndici(proxy) };
+      }
+    }
 
     const socketConfig: UserFacingSocketConfig = {
       ...options,

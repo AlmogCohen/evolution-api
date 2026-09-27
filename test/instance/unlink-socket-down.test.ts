@@ -209,7 +209,8 @@ describe('unlinking an instance whose connection is down', () => {
     await settle(service);
     await expectPending();
     expect(waMonitor.waInstances.test).toBeUndefined();
-    expect(prisma.instance.rows).toEqual([]);
+    // Its row stays until the logout is delivered: deleting it would cascade to the session.
+    expect(prisma.instance.rows.map((r: any) => r.name)).toEqual(['test']);
   });
 
   it('delete removes the instance even when its logout fails for another reason', async () => {

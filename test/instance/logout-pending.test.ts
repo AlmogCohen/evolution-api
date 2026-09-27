@@ -358,7 +358,8 @@ describe('a logout that cannot reach WhatsApp', () => {
         response: { message: 'Instance deleted; its logout will reach WhatsApp when the connection returns' },
       },
     });
-    // Gone from the API: no instance, no row, no settings. Kept: the creds, the key files and marker, the proxy.
+    // Gone from the API: no instance, no settings. Kept: the row (deleting it would cascade to the
+    // session and the proxy), the creds, the key files and marker, the proxy.
     expect(monitor.waInstances.test).toBeUndefined();
     expect({
       instances: prisma.instance.rows.length,
@@ -367,7 +368,7 @@ describe('a logout that cannot reach WhatsApp', () => {
       me: storedMe(),
       marker: JSON.parse(readFileSync(MARKER, 'utf8')),
     }).toMatchObject({
-      instances: 0,
+      instances: 1,
       settings: 0,
       proxies: 1,
       me: [WUID],
@@ -397,7 +398,8 @@ describe('a logout that cannot reach WhatsApp', () => {
       me: storedMe(),
       dir: existsSync(DIR),
       proxies: prisma.proxy.rows.length,
-    }).toEqual({ logouts: 1, emitted: [], me: [], dir: false, proxies: 0 });
+      instances: prisma.instance.rows.length,
+    }).toEqual({ logouts: 1, emitted: [], me: [], dir: false, proxies: 0, instances: 0 });
     // Finished: the name is gone from the API.
     expect((await call('GET', 'connectionState', globalKey)).status).toBe(404);
   });

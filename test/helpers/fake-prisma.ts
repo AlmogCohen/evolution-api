@@ -87,6 +87,29 @@ export function fakePrisma() {
     typebot: table('typebot', () => undefined),
     websocket: table('websocket', (r) => r.instanceId),
   };
+  // As the real schema: every table that belongs to an instance references Instance ON DELETE
+  // CASCADE (Session by sessionId), so deleting the row deletes them too.
+  const cascade = (removed: Row[]) => {
+    for (const instance of removed) {
+      for (const [name, t] of Object.entries(db) as [string, any][]) {
+        if (name === 'instance' || !Array.isArray(t?.rows)) continue;
+        const key = name === 'session' ? 'sessionId' : 'instanceId';
+        for (const r of t.rows.filter((r: Row) => r[key] === instance.id)) t.rows.splice(t.rows.indexOf(r), 1);
+      }
+    }
+  };
+  const { delete: del, deleteMany } = db.instance;
+  db.instance.delete = async (args: Row) => {
+    const removed = await del(args);
+    if (removed) cascade([removed]);
+    return removed;
+  };
+  db.instance.deleteMany = async (args: Row = {}) => {
+    const removed = db.instance.rows.filter((r: Row) => matches(r, args.where));
+    const result = await deleteMany(args);
+    cascade(removed);
+    return result;
+  };
   db.$transaction = async (ops: any) => (typeof ops === 'function' ? ops(db) : Promise.all(ops));
   db.$queryRaw = async () => [];
   db.$executeRaw = async () => 0;

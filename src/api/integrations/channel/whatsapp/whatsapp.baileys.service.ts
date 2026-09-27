@@ -570,6 +570,12 @@ export class BaileysStartupService extends ChannelStartupService {
     this.stopReconnecting();
     try {
       await this.removeSession();
+      if (logout.deleted) {
+        // Out of the API already: remove what was kept for the logout, the row last (it cascades to
+        // the rest). Before the marker goes, so a failure here is finished again on the next try.
+        await this.prismaRepository.proxy.deleteMany({ where: { instanceId: this.instanceId } });
+        await this.prismaRepository.instance.deleteMany({ where: { id: this.instanceId } });
+      }
     } catch (error) {
       // The device is off WhatsApp; the next connection answers loggedOut, which finishes it again.
       this.logger.error({ message: 'Could not wipe the session after the logout', error: error?.toString() });
@@ -581,8 +587,7 @@ export class BaileysStartupService extends ChannelStartupService {
     this.logout = null;
 
     if (logout.deleted) {
-      // Out of the API already: remove what was kept for the logout, and announce nothing.
-      await this.prismaRepository.proxy.deleteMany({ where: { instanceId: this.instanceId } }).catch(() => undefined);
+      // Announce nothing.
       this.shutdown();
       this.stateConnection = { state: 'close', statusReason: DisconnectReason.loggedOut };
       this.eventEmitter.emit('logout.finished', this);

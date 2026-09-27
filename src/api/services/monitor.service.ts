@@ -104,6 +104,8 @@ export class WAMonitoringService {
 
     const clientName = this.configService.get<Database>('DATABASE').CONNECTION.CLIENT_NAME;
 
+    // A deleted instance finishing its logout keeps its row until then, out of the API.
+    const finishing = Object.keys(this.finishingLogouts);
     const where =
       instanceNames && instanceNames.length > 0
         ? {
@@ -112,7 +114,7 @@ export class WAMonitoringService {
             },
             clientName,
           }
-        : { clientName };
+        : { clientName, ...(finishing.length ? { name: { notIn: finishing } } : {}) };
 
     const instances = await this.prismaRepository.instance.findMany({
       where,
@@ -196,7 +198,12 @@ export class WAMonitoringService {
     }
   }
 
-  /** `keepForLogout`: keep the session (creds, key files, logout marker) and the proxy a pending logout still needs. */
+  /**
+   * `keepForLogout`: keep what a pending logout still needs: the session (creds, key files, logout
+   * marker), the proxy, and the Instance row itself, since Session and Proxy reference it ON DELETE
+   * CASCADE. Its token is cleared, so the deleted instance's key authenticates nothing. The row goes
+   * when the logout has reached WhatsApp (BaileysStartupService.finishLogout).
+   */
   public async cleaningStoreData(instanceName: string, { keepForLogout = false } = {}) {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
       const instancePath = join(STORE_DIR, 'chatwoot', instanceName);
@@ -232,6 +239,10 @@ export class WAMonitoringService {
     await this.prismaRepository.setting.deleteMany({ where: { instanceId: instance.id } });
     await this.prismaRepository.label.deleteMany({ where: { instanceId: instance.id } });
 
+    if (keepForLogout) {
+      await this.prismaRepository.instance.update({ where: { id: instance.id }, data: { token: null } });
+      return;
+    }
     await this.prismaRepository.instance.delete({ where: { name: instanceName } });
   }
 
@@ -251,9 +262,9 @@ export class WAMonitoringService {
   }
 
   /**
-   * Delete while the logout could not reach WhatsApp: the instance leaves the API now (memory, its
-   * row and everything else stored for it), keeping only its session and proxy, and finishes the
-   * logout in the background. The service removes those when it has (BaileysStartupService.finishLogout).
+   * Delete while the logout could not reach WhatsApp: the instance leaves the API now (memory and
+   * everything stored for it), keeping only its row, session and proxy, and finishes the logout in
+   * the background. The service removes those when it has (BaileysStartupService.finishLogout).
    */
   public async deleteKeepingLogout(instanceName: string) {
     const instance = this.waInstances[instanceName];
@@ -265,7 +276,11 @@ export class WAMonitoringService {
     this.logger.warn(`Instance "${instanceName}" - REMOVED, its logout pending`);
   }
 
-  /** On boot: a deleted instance (no row) whose logout marker is still there finishes its logout. */
+  /**
+   * On boot: a deleted instance with no row whose logout marker is still there finishes its logout.
+   * Only a delete made before the row was kept leaves that (its session went with the row); a row
+   * that is still there is loaded by setInstance.
+   */
   private async resumeDeletedLogouts() {
     let ids: string[];
     try {
@@ -348,9 +363,13 @@ export class WAMonitoringService {
       ownerJid: instanceData.ownerJid,
     });
 
-    // A logout that had not reached WhatsApp before the restart: connect only to deliver it.
-    if (await (instance as any).resumePendingLogout?.()) {
-      this.waInstances[instanceData.instanceName] = instance;
+    // A logout that had not reached WhatsApp before the restart: connect only to deliver it. A
+    // deleted instance's row is kept until then, and it stays out of the API (finishingLogouts).
+    const marker = readLogoutMarker(instanceData.instanceId);
+    if (marker && (instance as any).resumePendingLogout) {
+      if (marker.deleted) this.finishingLogouts[instanceData.instanceName] = instance;
+      else this.waInstances[instanceData.instanceName] = instance;
+      await (instance as any).resumePendingLogout();
       return;
     }
 

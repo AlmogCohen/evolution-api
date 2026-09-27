@@ -5,6 +5,8 @@ import { BadRequestException, ForbiddenException, InternalServerErrorException, 
 import { NextFunction, Request, Response } from 'express';
 
 async function getInstance(instanceName: string) {
+  // A deleted instance keeps its row while its logout is pending, but is gone from the API.
+  if (waMonitor.finishingLogouts?.[instanceName]) return false;
   try {
     const cacheConf = configService.get<CacheConf>('CACHE');
 

@@ -7,6 +7,7 @@ const matches = (row: Row, where: Row = {}) =>
     if (k === 'remoteJid_instanceId') return row.remoteJid === v.remoteJid && row.instanceId === v.instanceId;
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       if ('in' in v) return (v.in as any[]).includes(row[k]);
+      if ('notIn' in v) return !(v.notIn as any[]).includes(row[k]);
       if ('path' in v) return true; // JSON path filters: not modelled, treated as match
       return matches(row[k] ?? {}, v);
     }

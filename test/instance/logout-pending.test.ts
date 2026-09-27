@@ -426,6 +426,29 @@ describe('a logout that cannot reach WhatsApp', () => {
     });
   });
 
+  // A delete made before the row was kept for the logout left a marker and no row. The boot still
+  // finishes it (resumeDeletedLogouts): out of the API, then the marker and key files go.
+  it('a deleted marker with no row (a delete from before the row was kept) is still finished on boot', async () => {
+    const { service } = await waitingToReconnect();
+    expect((await call('DELETE', 'delete')).status).toBe(202);
+    service.stopReconnecting();
+    service.connect = async () => undefined;
+    socketSpy.mockClear();
+    prisma.instance.rows.length = 0;
+
+    const monitor = await startProcess();
+    const sock = await reconnected(1);
+    expect(monitor.waInstances.test).toBeUndefined();
+    const finishing = monitor.finishingLogouts.test;
+    expect(finishing).toBeDefined();
+    await opened(sock);
+    await settle(finishing);
+    expect({ dir: existsSync(DIR), finishing: monitor.finishingLogouts.test }).toEqual({
+      dir: false,
+      finishing: undefined,
+    });
+  });
+
   it('a logout on an open connection still completes at once', async () => {
     await linkedInstance();
     const monitor = await startProcess();

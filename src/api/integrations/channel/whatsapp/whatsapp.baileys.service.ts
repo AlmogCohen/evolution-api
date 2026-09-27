@@ -425,13 +425,22 @@ export class BaileysStartupService extends ChannelStartupService {
    * WhatsApp and is wiped at once.
    */
   public async logoutInstance(): Promise<'done' | 'pending'> {
+    // One logout at a time: a second call (another client, a delete) waits for the one under way and
+    // answers with its outcome. Installed before any wait, so two calls can never both start one.
+    this.logoutRun ??= this.runLogout().finally(() => (this.logoutRun = null));
+    const result = await this.logoutRun;
+    // A 202 promises the logout survives a restart: when that cannot be recorded, the caller hears
+    // it, and every call tries again.
+    if (result === 'pending') await this.recordPending();
+    return result;
+  }
+
+  private logoutRun: Promise<'done' | 'pending'> | null = null;
+
+  private async runLogout(): Promise<'done' | 'pending'> {
     // A connect under way finishes first, so the socket logged out is the one it builds.
     await this.connecting?.socket.catch(() => undefined);
-    if (this.logout?.marked) {
-      await this.recordPending();
-      return 'pending';
-    }
-    if (this.logout) return 'done';
+    if (this.logout?.marked) return 'pending';
 
     const linked = await this.hasLinkedSession();
     this.messageProcessor.onDestroy();
@@ -467,10 +476,8 @@ export class BaileysStartupService extends ChannelStartupService {
     const late = new Promise<'late'>((r) => (timer = setTimeout(() => r('late'), 10_000)));
     const result = await Promise.race([outcome, late]);
     clearTimeout(timer);
-    if (result === 'late') await this.markLogoutPending();
-    // A 202 promises the logout survives a restart: when that cannot be recorded, the caller hears it.
-    if (result === 'late' || result === 'pending') {
-      await this.recordPending();
+    if (result === 'late') {
+      await this.markLogoutPending();
       return 'pending';
     }
     return result;

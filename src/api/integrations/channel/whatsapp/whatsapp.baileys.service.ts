@@ -323,6 +323,14 @@ const isExpiredMedia = (error: any, media: { url?: string | null; directPath?: s
  */
 export const MEDIA_REUPLOAD_TIMEOUT_MS = 60_000;
 
+/** A socket build stopped because the instance was shut down meanwhile. */
+class ConnectAborted extends Error {
+  constructor() {
+    super('The instance was shut down while its connection was being built');
+    this.name = 'ConnectAborted';
+  }
+}
+
 /** The pending logout recordPending wrote on an instance's row (disconnectionObject), if there is one. */
 const pendingOnRow = (value: unknown): { deleted: boolean } | undefined => {
   let object: any = value;
@@ -548,10 +556,21 @@ export class BaileysStartupService extends ChannelStartupService {
     return this.hasLinkedSession();
   }
 
-  /** The instance is removed from the API: no reconnect, and its socket let go of without its close being handled. */
+  /**
+   * The instance is removed from the API: no reconnect, its socket let go of without its close being
+   * handled, and no socket built after this, including one being built now (createClient checks).
+   */
   public shutdown() {
+    this.shutDown = true;
     this.stopReconnecting();
     this.retireClient();
+  }
+
+  private shutDown = false;
+
+  /** A socket build stops at its next step once the instance is shut down. */
+  private stillWanted() {
+    if (this.shutDown) throw new ConnectAborted();
   }
 
   /** Whether the stored session is a linked device (creds carry `me`), i.e. whether WhatsApp has something to remove. */
@@ -1067,7 +1086,10 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async createClient(number?: string): Promise<WASocket> {
-    this.instance.authState = await this.defineAuthState();
+    this.stillWanted();
+    const authState = await this.defineAuthState();
+    this.stillWanted();
+    this.instance.authState = authState;
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
 
@@ -1125,6 +1147,7 @@ export class BaileysStartupService extends ChannelStartupService {
       options ? { httpsAgent: options.fetchAgent, proxy: false } : {},
       options ? ({ dispatcher: this.mediaProxy.dispatcher } as RequestInit) : {},
     );
+    this.stillWanted();
     const version = baileysVersion.version;
     const log = `Baileys version: ${version.join('.')}`;
 
@@ -1192,6 +1215,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    this.stillWanted();
     this.retireClient();
     this.client = makeWASocket(socketConfig);
     // Any reconnect still waiting was for the socket just replaced.
@@ -1270,6 +1294,7 @@ export class BaileysStartupService extends ChannelStartupService {
    * reconnect still happens.
    */
   private async connect(number?: string): Promise<WASocket> {
+    this.stillWanted();
     const inFlight = this.connecting;
     if (inFlight && inFlight.number === (number ?? null)) return inFlight.socket;
 
@@ -1301,6 +1326,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return await this.createClient(number);
     } catch (error) {
+      // Shut down while it was being built: nothing failed, nothing to retry.
+      if (error instanceof ConnectAborted) throw error;
       this.logger.error({ message: 'Connect failed', error: errorFields(error) });
       // The same 500, still carrying what failed (not enumerable, so not in an HTTP answer): a reconnect logs it.
       try {
@@ -1313,6 +1340,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private scheduleReconnect(statusCode?: number) {
     this.stopReconnecting();
+    if (this.shutDown) return;
     const delay = Math.min(
       BaileysStartupService.RECONNECT_FIRST_DELAY_MS * 2 ** Math.min(this.reconnectAttempts, 16),
       BaileysStartupService.RECONNECT_MAX_DELAY_MS,
@@ -1339,11 +1367,18 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * A new socket after a profile or privacy change, through the same one-at-a-time connect as any
+   * other: it joins a connect under way. Nothing for an instance shut down, or one whose pending
+   * logout owns the connection.
+   */
   public async reloadConnection(): Promise<WASocket> {
+    if (this.shutDown || this.logout) return this.client;
     try {
-      return await this.createClient(this.phoneNumber);
+      return await this.connect(this.phoneNumber);
     } catch (error) {
-      this.logger.error({ message: 'Reload connection failed', error: errorFields(error) });
+      if (error instanceof ConnectAborted) return this.client;
+      this.logger.error({ message: 'Reload connection failed', error: errorFields(error?.cause ?? error) });
       throw new InternalServerErrorException(error?.toString());
     }
   }

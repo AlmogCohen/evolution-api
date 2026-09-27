@@ -574,10 +574,15 @@ describe('a logout that cannot reach WhatsApp', () => {
     await opened(sock);
     let release: () => void;
     const gate = new Promise<void>((r) => (release = r));
-    const logout = sock.logout;
+    // Hold the request to remove the device, however it is sent.
+    const { logout, query } = sock;
     sock.logout = async (msg?: string) => {
       await gate;
       return logout(msg);
+    };
+    sock.query = async (node: any) => {
+      await gate;
+      return query(node);
     };
 
     const answered: string[] = [];

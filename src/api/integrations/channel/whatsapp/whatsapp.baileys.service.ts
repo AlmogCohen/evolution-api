@@ -131,6 +131,7 @@ import makeWASocket, {
   prepareWAMessageMedia,
   Product,
   proto,
+  S_WHATSAPP_NET,
   UserFacingSocketConfig,
   WABrowserDescription,
   WAMediaUpload,
@@ -365,6 +366,9 @@ export class BaileysStartupService extends ChannelStartupService {
   // it takes: an instance that gave up would sit disconnected on valid credentials. An open resets it.
   private static readonly RECONNECT_FIRST_DELAY_MS = 1_000;
   private static readonly RECONNECT_MAX_DELAY_MS = 60_000;
+  // How long WhatsApp gets to answer a remove-companion-device before the next connection is asked
+  // instead; under logoutInstance's own 10s, so a logout that goes unanswered answers 202.
+  private static readonly REMOVE_ANSWER_TIMEOUT_MS = 8_000;
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   // The connect under way, so a second one joins it instead of building a second socket.
@@ -453,8 +457,9 @@ export class BaileysStartupService extends ChannelStartupService {
     if (linked) {
       try {
         if (this.stateConnection.state !== 'open') throw new Error('the connection is not open');
-        // Sends remove-companion-device, then ends the socket with loggedOut: that close finishes it.
-        await this.client.logout('Log out instance: ' + this.instanceName);
+        // Confirmed: the socket ends with loggedOut, which finishes it. Not: it ends with a code that
+        // reconnects, and the logout is pending until the next connection says (logoutUpdate).
+        await this.removeFromWhatsApp();
       } catch (error) {
         this.logger.warn(`Logout could not reach WhatsApp (${error?.message}): pending until the connection returns`);
         await this.markLogoutPending();
@@ -620,7 +625,7 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'open') {
       this.reconnectAttempts = 0;
       try {
-        await this.client.logout('Log out instance: ' + this.instanceName);
+        await this.removeFromWhatsApp();
       } catch (error) {
         // The socket dropped before the logout went out: its close reconnects.
         this.logger.warn(`Pending logout not sent (${error?.message}), trying again on the next connection`);
@@ -629,13 +634,48 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
-      // loggedOut: the logout went out, or WhatsApp had already removed the device. The other
-      // final codes leave nothing to log out either.
+      // loggedOut: WhatsApp confirmed the removal (removeFromWhatsApp then ends the socket so), or
+      // refused the device on connecting (it is already removed). The other final codes leave
+      // nothing to log out either.
       if ([DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406].includes(statusCode)) {
         return this.finishLogout();
       }
       if (!this.logout.marked) return this.markLogoutPending();
       this.scheduleReconnect(statusCode);
+    }
+  }
+
+  /**
+   * Ask WhatsApp to remove this device (remove-companion-device) and wait for its answer. Baileys'
+   * logout() writes the same request but waits for nothing and then ends the socket itself with
+   * loggedOut, a close that says nothing about whether WhatsApp got it. Here the socket ends with
+   * loggedOut only once WhatsApp answered; otherwise (no answer in time, an error answer, the
+   * connection failing) it ends with a code that reconnects, and the next connection says: WhatsApp
+   * refusing the device (401) finishes the logout, an open asks again. Throws when the request could
+   * not be written at all.
+   */
+  private async removeFromWhatsApp() {
+    const client = this.client;
+    const jid = this.instance.authState?.state?.creds?.me?.id ?? client.user?.id;
+    let confirmed = false;
+    try {
+      const answer: any = await client.query(
+        {
+          tag: 'iq',
+          attrs: { to: S_WHATSAPP_NET, type: 'set', xmlns: 'md' },
+          content: [{ tag: 'remove-companion-device', attrs: { jid, reason: 'user_initiated' } }],
+        },
+        BaileysStartupService.REMOVE_ANSWER_TIMEOUT_MS,
+      );
+      confirmed = answer?.attrs?.type === 'result';
+    } catch (error) {
+      this.logger.warn(`WhatsApp did not confirm the logout (${errorName(error)}): checking on the next connection`);
+    }
+    if (client !== this.client) return;
+    if (confirmed) {
+      client.end(new Boom('Intentional Logout', { statusCode: DisconnectReason.loggedOut }));
+    } else {
+      client.end(new Boom('Logout not confirmed', { statusCode: DisconnectReason.connectionClosed }));
     }
   }
 

@@ -149,6 +149,30 @@ describe('live-check scrubber', () => {
     expect(report.people).toBe(2);
   });
 
+  it('keeps a numeric message id a message id, never a person', () => {
+    // WhatsApp gives group notifications (a create, a rename, an add) numeric ids.
+    const id = '8347261905';
+    const stub = {
+      seq: 999,
+      t: 1,
+      socket: 1,
+      event: 'messages.upsert',
+      buffered: false,
+      data: { type: 'append', messages: [{ key: { remoteJid: '120363401234567890@g.us', fromMe: false, id }, messageStubType: 20 }] },
+    };
+    appendFileSync(join(raw, 'events.ndjson'), JSON.stringify(stub) + '\n');
+    const { dir, report } = scrub();
+
+    const line = lines(join(dir, 'events.ndjson')).find((e) => e.seq === 999);
+    const fake = line.data.messages[0].key.id;
+    expect(fake).toMatch(/^\d+$/);
+    expect(fake).toHaveLength(id.length);
+    expect(fake.slice(0, 2)).toBe(id.slice(0, 2));
+    expect(fake).not.toBe(id);
+    expect(report.people).toBe(2);
+    expect(report.messageIds).toBeGreaterThan(0);
+  });
+
   it('takes a country code only, never a number', () => {
     expect(() => scrub({ operator: { countryCode: '972541112233' } })).toThrow(/country code/);
     expect(existsSync(join(out, '2026-09-27-synthetic-session'))).toBe(false);

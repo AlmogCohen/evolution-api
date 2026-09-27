@@ -328,4 +328,24 @@ describe('deleting an instance whose logout cannot reach WhatsApp (real Postgres
     expect(monitor.finishingLogouts.test).toBeUndefined();
     expect((await call('GET', 'connectionState', globalKey)).status).toBe(404);
   });
+
+  it('survives a restart that lost the instances volume: the row alone keeps it pending and hidden', async () => {
+    const { service } = await waitingToReconnect();
+    expect((await call('DELETE', 'delete')).status).toBe(202);
+    service.stopReconnecting();
+    service.connect = async () => undefined;
+    socketSpy.mockClear();
+    rmSync(DIR, { recursive: true, force: true });
+
+    const monitor = await startProcess();
+    const sock = await reconnected(1);
+    expect(monitor.waInstances.test).toBeUndefined();
+    await hiddenFromTheApi();
+    await opened(sock);
+    await settle(monitor.finishingLogouts.test);
+    expect({ logouts: sock.logouts, rows: await rows() }).toEqual({
+      logouts: 1,
+      rows: { instances: 0, sessions: 0, proxies: 0, settings: 0 },
+    });
+  });
 });

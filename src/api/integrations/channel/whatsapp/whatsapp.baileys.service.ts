@@ -251,6 +251,10 @@ type MediaReupload = 'not_requested' | 'ok' | 'failed';
 /** The HTTP status a Baileys media error carries (a Boom's output.statusCode), or 'none'. */
 const httpStatus = (error: any) => error?.output?.statusCode ?? error?.status ?? 'none';
 
+/** What kind of error was thrown, never what it says: a thrown string is 'string'. */
+const errorName = (error: any): string =>
+  typeof error === 'string' ? 'string' : typeof error?.name === 'string' ? error.name.slice(0, 40) : 'unknown';
+
 /**
  * Why the phone refused a re-upload, from the error Baileys' updateMediaMessage threw:
  * the phone's MediaRetryNotification result (NOT_FOUND, DECRYPTION_ERROR, GENERAL_ERROR),
@@ -4641,7 +4645,10 @@ export class BaileysStartupService extends ChannelStartupService {
           buffer = Buffer.concat(chunks);
           this.logger.info('Download Media with downloadContentFromMessage was successful!');
         } catch (fallbackErr) {
-          this.logger.error('Download Media with downloadContentFromMessage also failed!');
+          // Its error carries the signed media URL (message and data.url): name and status only.
+          this.logger.error(
+            `media fallback: ${media}, outcome=failed, error=${errorName(fallbackErr)}, status=${httpStatus(fallbackErr)}`,
+          );
           throw fallbackErr;
         }
       }
@@ -4688,8 +4695,10 @@ export class BaileysStartupService extends ChannelStartupService {
         buffer: getBuffer ? buffer : null,
       };
     } catch (error) {
-      this.logger.error('Error processing media message:');
-      this.logger.error(error);
+      const key = data?.message?.key;
+      this.logger.error(
+        `media processing failed: message=${key?.id}, chat=${jidKind(key?.remoteJid)}, error=${errorName(error)}, status=${httpStatus(error)}`,
+      );
       if (reupload === undefined) throw new BadRequestException(error.toString());
       // The same 400, plus whether the phone was asked to re-upload the file, and why it refused.
       try {

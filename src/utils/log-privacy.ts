@@ -15,9 +15,14 @@ export function jidKind(jid: unknown): string {
   return 'other';
 }
 
-/** Mask anything in a diagnostic string that looks like a JID or a phone number. */
+/**
+ * Mask anything in a diagnostic string that looks like a URL, a JID or a phone
+ * number. A URL goes first, and whole: a WhatsApp media link is signed per
+ * message (`oh`, `oe` in its query), and whoever holds it can fetch the file.
+ */
 export function scrub(value: unknown): string {
   return String(value ?? '')
+    .replace(/[a-z][a-z0-9+.-]*:\/\/[^\s'"<>]+/gi, '[url]')
     .replace(/[^\s'"<>=,;:()[\]{}]+@[^\s'"<>=,;:()[\]{}]+/g, '[jid]')
     .replace(/\d{6,}/g, '[number]');
 }

@@ -426,6 +426,13 @@ export class BaileysStartupService extends ChannelStartupService {
     if (!this.logout || this.logout.marked) return;
     this.logout.marked = true;
     await this.writeMarker();
+    // The row too: the boot auto-connects only an open or connecting row, so even if the marker
+    // file is lost the instance does not come back as a normal one (it stays down, creds kept).
+    await this.prismaRepository.instance
+      .update({ where: { id: this.instanceId }, data: { connectionStatus: 'close' } })
+      .catch((error) =>
+        this.logger.error({ message: 'Could not record the pending logout on the row', error: error?.toString() }),
+      );
     this.logout.settle('pending');
     if (!this.reconnectTimer && !this.connecting && this.stateConnection.state === 'close') this.scheduleReconnect();
   }

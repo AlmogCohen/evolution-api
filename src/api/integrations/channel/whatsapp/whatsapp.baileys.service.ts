@@ -257,6 +257,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private static readonly RECONNECT_MAX_DELAY_MS = 60_000;
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
+  // The connect under way, so a second one joins it instead of building a second socket.
+  private connecting: { number: string | null; socket: Promise<WASocket> } | null = null;
+  // Stops Evolution listening to the current socket; called before that socket is ended.
+  private detachClient?: () => void;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   // The dispatcher media downloads go through: the instance's proxy, the same exit as the socket.
@@ -380,7 +384,10 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>, from?: WASocket) {
+    // A replaced socket speaks for nobody: its close must not reconnect, its QR must not show.
+    if (from && from !== this.client) return;
+
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -765,29 +772,57 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    this.retireClient();
     this.client = makeWASocket(socketConfig);
+    // Any reconnect still waiting was for the socket just replaced.
+    this.stopReconnecting();
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
     }
 
-    this.eventHandler();
+    const client = this.client;
+    const stopProcessing = this.eventHandler();
 
-    this.client.ws.on('CB:call', (packet) => {
+    const onCall = (packet) => {
       this.logger.verbose(`CB:call id=${packet?.attrs?.id ?? ''}`);
       const payload = { event: 'CB:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    });
-
-    this.client.ws.on('CB:ack,class:call', (packet) => {
+    };
+    const onCallAck = (packet) => {
       this.logger.verbose(`CB:ack,class:call id=${packet?.attrs?.id ?? ''}`);
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    });
+    };
+    client.ws.on('CB:call', onCall);
+    client.ws.on('CB:ack,class:call', onCallAck);
+
+    this.detachClient = () => {
+      stopProcessing();
+      client.ws.off('CB:call', onCall);
+      client.ws.off('CB:ack,class:call', onCallAck);
+    };
 
     this.phoneNumber = number;
 
     return this.client;
+  }
+
+  /**
+   * Let go of the current socket before another is built: stop listening to it first, because
+   * ending a live Baileys socket announces a close, which would otherwise reconnect and end the
+   * new one in turn.
+   */
+  private retireClient() {
+    const previous = this.client;
+    this.detachClient?.();
+    this.detachClient = undefined;
+    if (!previous) return;
+    try {
+      previous.end(new Error('Replaced by a new connection'));
+    } catch (error) {
+      this.logger.warn({ message: 'Could not end the replaced socket', error: error?.toString() });
+    }
   }
 
   /** A new connect attempt: a fresh QR budget, and no QR or pairing code left from an earlier attempt. */
@@ -796,7 +831,30 @@ export class BaileysStartupService extends ChannelStartupService {
     return await this.connect(number);
   }
 
+  /**
+   * One connect at a time, for connectToWhatsapp and the reconnect alike. A connect that arrives
+   * while one is under way (/instance/connect polled during a reconnect) joins it; one for a
+   * different number runs after it. The socket it builds takes the place of a reconnect still
+   * waiting on its backoff (createClient drops that); if it fails before building one, the waiting
+   * reconnect still happens.
+   */
   private async connect(number?: string): Promise<WASocket> {
+    const inFlight = this.connecting;
+    if (inFlight && inFlight.number === (number ?? null)) return inFlight.socket;
+
+    const socket = (inFlight ? inFlight.socket.catch(() => undefined) : Promise.resolve()).then(() =>
+      this.openConnection(number),
+    );
+    const entry = { number: number ?? null, socket };
+    this.connecting = entry;
+    try {
+      return await socket;
+    } finally {
+      if (this.connecting === entry) this.connecting = null;
+    }
+  }
+
+  private async openConnection(number?: string): Promise<WASocket> {
     try {
       this.loadChatwoot();
       // The socket takes syncFullHistory, groupsIgnore, readStatus and alwaysOnline as config: read them first.
@@ -1031,7 +1089,8 @@ export class BaileysStartupService extends ChannelStartupService {
    * looked up, so no network query can follow.
    */
   private tapHistoryLidMappings() {
-    const ev = this.client.ev as any;
+    const client = this.client;
+    const ev = client.ev as any;
     if (ev.__lidPnMappingsTap) return;
     const emit = ev.emit.bind(ev);
     ev.emit = (event: string, data: any) => {
@@ -1039,7 +1098,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const mappings = [...data.lidPnMappings];
         this.eventProcessingQueue = this.eventProcessingQueue.then(() => {
           try {
-            if (!this.endSession) this.lidMappingHandle(mappings);
+            if (!this.endSession && client === this.client) this.lidMappingHandle(mappings);
           } catch (error) {
             this.logger.error(error);
           }
@@ -2009,10 +2068,14 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
-  private eventHandler() {
+  /** Returns the function that stops processing this socket's events. */
+  private eventHandler(): () => void {
+    const client = this.client;
     this.tapHistoryLidMappings();
 
-    this.client.ev.process(async (events) => {
+    return client.ev.process(async (events) => {
+      // Events a replaced socket still emits do not drive the instance.
+      if (client !== this.client) return;
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
           if (!this.endSession) {
@@ -2044,7 +2107,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
+              this.connectionUpdate(events['connection.update'], client);
             }
 
             if (events['creds.update']) {

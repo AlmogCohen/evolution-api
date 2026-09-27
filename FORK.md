@@ -48,7 +48,7 @@ named where one exists.
 - Group metadata is filled from `groups.update` instead of queried again for every group on every listing.
 
 **Messages and privacy**
-- A `getMessage` miss answers nothing, so Baileys no longer relays an empty message on a retry (#2705, #2550).
+- A `getMessage` miss or failed lookup answers nothing, so Baileys no longer relays an empty message on a retry and uses it up (#2705, and #2706 for groups; fixes also offered in #2728 and #2623).
 - No message text, phone number, JID or push name reaches the logs at `LOG_LEVEL=ERROR,WARN`, including Baileys' own error logs.
 
 **Proxy**

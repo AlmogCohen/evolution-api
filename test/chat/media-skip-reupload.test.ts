@@ -4,12 +4,7 @@
 // reuploadRequest, so the phone is never asked, and a file that has expired on
 // the CDN (404 or 410) fails at once, without Evolution's own 5s fallback, with
 // an error that says the file is gone and no re-upload was attempted.
-// Omitting the field keeps today's behaviour.
-//
-// Baileys 7.0.0-rc14 never asks for a re-upload on a CDN 404 or 410 (see
-// test/proxy/media-reupload.test.ts), so with rc14 "today's behaviour" is the
-// fallback and reupload: not_requested; under a Baileys that asks
-// (BAILEYS_DIR), it is the phone being asked. BAILEYS_ASKS picks the case.
+// Omitting the field keeps today's behaviour: the phone is asked.
 import { vi } from 'vitest';
 
 const h = vi.hoisted(() => ({ waMonitor: undefined as any, chatController: undefined as any }));
@@ -29,7 +24,7 @@ vi.mock('@api/server.module', async () => {
 
 import { readFile, rm } from 'node:fs/promises';
 
-import { downloadMediaMessage, encryptedStream } from 'baileys';
+import { encryptedStream } from 'baileys';
 import { getGlobalDispatcher, MockAgent, setGlobalDispatcher } from 'undici';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
@@ -45,17 +40,6 @@ const LIVE = '/v/t62.7118-24/reuploaded.enc';
 const GONE = '/v/t62.7118-24/expired.enc';
 const GONE_MESSAGE =
   "The media is no longer on WhatsApp's servers (HTTP 404), and no re-upload from the phone was attempted (reupload: false)";
-
-/** Whether the Baileys under test asks for a re-upload when the CDN answers 404. */
-const BAILEYS_ASKS = await (async () => {
-  const cdn = await startCdn({});
-  let asked = false;
-  const expired = { key: { id: 'PROBE' }, message: { imageMessage: { url: `http://127.0.0.1:${cdn.port}${GONE}`, mediaKey: new Uint8Array(32) } } };
-  const silent: any = { info: () => undefined, debug: () => undefined, trace: () => undefined, warn: () => undefined, error: () => undefined };
-  await (downloadMediaMessage as any)(expired, 'buffer', {}, { logger: silent, reuploadRequest: async () => ((asked = true), Promise.reject(new Error('probe'))) }).catch(() => undefined);
-  await cdn.close();
-  return asked;
-})();
 
 let cdn: Listening;
 let mediaKey: Uint8Array;
@@ -162,17 +146,7 @@ describe('a media download can skip asking the phone to re-upload', () => {
     expect(Buffer.from(answer.body.base64, 'base64').equals(PLAIN)).toBe(true);
   });
 
-  it.runIf(!BAILEYS_ASKS)('reupload omitted: as before, Evolution falls back to its own retry (rc14 never asks the phone)', async () => {
-    const answer = await post({ message: expiredImage() });
-
-    expect(asked).toEqual([]);
-    expect(answer).toEqual({
-      status: 400,
-      body: { status: 400, error: 'Bad Request', response: { message: ['TypeError: fetch failed'], reupload: 'not_requested' } },
-    });
-  });
-
-  it.runIf(BAILEYS_ASKS)('reupload omitted: as before, the phone is asked and the download succeeds', async () => {
+  it('reupload omitted: as before, the phone is asked and the download succeeds', async () => {
     const answer = await post({ message: expiredImage() });
 
     expect(asked).toEqual([ID]);

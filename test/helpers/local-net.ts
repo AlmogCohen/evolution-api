@@ -31,12 +31,14 @@ async function listen(server: net.Server): Promise<number> {
 }
 
 /** Serves `files` (path -> bytes) and logs `METHOD path` for every request. */
-export async function startCdn(files: Record<string, Buffer>): Promise<Listening> {
+/** Serves `files` by path; a number instead of a body answers that status. Anything else is 404. */
+export async function startCdn(files: Record<string, Buffer | number>): Promise<Listening> {
   const log: string[] = [];
   const server = http.createServer((req, res) => {
     log.push(`${req.method} ${req.url}`);
     const body = files[req.url ?? ''];
     if (!body) return void res.writeHead(404).end();
+    if (typeof body === 'number') return void res.writeHead(body).end();
     res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': body.length }).end(body);
   });
   const close = track(server);

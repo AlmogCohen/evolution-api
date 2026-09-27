@@ -456,7 +456,20 @@ export class InstanceController {
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
       if (instance.state === 'connecting' || instance.state === 'open') {
-        await this.logout({ instanceName });
+        try {
+          await this.logout({ instanceName });
+        } catch (error) {
+          // A failed logout must not stop the delete. The remove.instance emit
+          // below is the only path that purges the in-memory entry and runs
+          // cleaningUp() and cleaningStoreData(), which wipe the session again.
+          // Without this catch, the stale entry persists until the entire
+          // process restarts.
+          this.logger.warn({
+            message: 'logout failed during deleteInstance, proceeding with cleanup',
+            instanceName,
+            error,
+          });
+        }
       }
 
       try {

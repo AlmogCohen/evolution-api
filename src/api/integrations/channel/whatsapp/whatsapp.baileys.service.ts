@@ -269,10 +269,31 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async logoutInstance() {
     this.messageProcessor.onDestroy();
-    await this.client?.logout('Log out instance: ' + this.instanceName);
 
-    this.client?.ws?.close();
+    // Baileys' logout tells WhatsApp to remove this device and then ends the socket.
+    // With the socket down the first step throws ('Connection Closed') and the socket
+    // is never ended. Unlink locally anyway: wipe the credentials, then end the socket
+    // as a logout would. A loggedOut close is final (no reconnect) and runs the same
+    // cleanup as a logout that reached WhatsApp. The device stays listed on the phone.
+    let unreachable = false;
+    try {
+      await this.client?.logout('Log out instance: ' + this.instanceName);
 
+      this.client?.ws?.close();
+    } catch (error) {
+      unreachable = true;
+      this.logger.warn(`Logout could not reach WhatsApp (${error?.message}), unlinking locally`);
+    }
+
+    try {
+      await this.removeSession();
+    } finally {
+      if (unreachable)
+        await this.client?.end(new Boom('Intentional Logout', { statusCode: DisconnectReason.loggedOut }));
+    }
+  }
+
+  private async removeSession() {
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
     const provider = this.configService.get<ProviderSession>('PROVIDER');

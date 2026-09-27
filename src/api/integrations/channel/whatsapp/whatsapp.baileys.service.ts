@@ -4851,8 +4851,24 @@ export class BaileysStartupService extends ChannelStartupService {
           }, MEDIA_REUPLOAD_TIMEOUT_MS);
         });
         try {
-          const ask = async () =>
-            this.client.updateMediaMessage({ ...message, key: await this.originalMessageKey(message.key) });
+          // The key's original form first; when the key cannot say which address the phone keeps the
+          // message under (the phone with its @lid beside it), the key as given if the phone refuses.
+          const ask = async () => {
+            const original = await this.originalMessageKey(message.key);
+            const candidates = [original];
+            if (JSON.stringify(original) !== JSON.stringify(message.key)) candidates.push(message.key);
+            for (const [i, key] of candidates.entries()) {
+              try {
+                return await this.client.updateMediaMessage({ ...message, key });
+              } catch (error) {
+                const refused = typeof error?.data?.result === 'number';
+                if (!refused || i === candidates.length - 1) throw error;
+                this.logger.warn(
+                  `media download: ${media}, outcome=reupload_refused, reason=${reuploadRefusal(error)}, trying the other address`,
+                );
+              }
+            }
+          };
           const updated = await Promise.race([ask(), timeout]);
           reupload = 'ok';
           this.logger.warn(`media download: ${media}, outcome=reupload_ok`);

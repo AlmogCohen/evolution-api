@@ -51,4 +51,12 @@ describe('an instance shut down while batches wait on its queue', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(emitted.map((e) => e.event)).toEqual([]);
   });
+
+  it('still announces its own removal, which the monitor sends after shutting it down', async () => {
+    emitted.length = 0;
+    const { service } = await makeService();
+    service.shutdown();
+    await service.sendDataWebhook('remove.instance', null);
+    expect(emitted.map((e) => e.event)).toEqual(['remove.instance']);
+  });
 });

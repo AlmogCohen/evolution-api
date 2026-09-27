@@ -746,7 +746,9 @@ export class BaileysStartupService extends ChannelStartupService {
     logout.settle('done');
   }
 
-  // While a logout is under way the instance forwards nothing.
+  // While a logout is under way, and once the instance is shut down (removed), it forwards nothing:
+  // work that finishes late (a queued batch, a picture lookup, an open's handler) included. The
+  // one exception is the removal's own announcement, which the monitor sends after the shutdown.
   public async sendDataWebhook<T extends object = any>(
     event: Events,
     data: T,
@@ -754,7 +756,7 @@ export class BaileysStartupService extends ChannelStartupService {
     integration?: string[],
     extra?: Record<string, any>,
   ) {
-    if (this.logout) return;
+    if (this.logout || (this.shutDown && event !== Events.REMOVE_INSTANCE)) return;
     this.liveRecorder?.webhook(event, data, extra);
     return super.sendDataWebhook(event, data, local, integration, extra);
   }
@@ -2571,6 +2573,11 @@ export class BaileysStartupService extends ChannelStartupService {
       // Events a replaced socket still emits do not drive the instance.
       if (client !== this.client) return;
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
+        // Checked again when the batch runs, which can be long after it was queued: an instance shut
+        // down meanwhile (removed) handles nothing more. A batch of a socket replaced meanwhile by a
+        // reconnect of the same session still runs: its messages were delivered and acknowledged to
+        // WhatsApp, which will not send them again.
+        if (this.shutDown) return;
         try {
           // A logout under way: nothing is forwarded or stored; the connection only delivers the logout.
           if (this.logout) {

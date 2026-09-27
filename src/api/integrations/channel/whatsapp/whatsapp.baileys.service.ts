@@ -273,32 +273,46 @@ const reuploadRefusal = (error: any): string => {
 };
 
 /**
- * When a WhatsApp media link stops working, in unix seconds: its `oe` query parameter
- * (hex), read from the url, else from the directPath. Undefined when neither has one.
+ * When a WhatsApp media link stops working, in ms: its `oe` query parameter (hex unix
+ * seconds). Read with URLSearchParams, so the name is case-sensitive, the value is
+ * percent-decoded and a fragment never counts. Undefined unless the query carries exactly
+ * one `oe` and it is plain hex.
  */
-const mediaLinkExpiry = (
-  media: { url?: string | null; directPath?: string | null } | undefined,
-): number | undefined => {
-  for (const link of [media?.url, media?.directPath]) {
-    const oe = link?.match(/[?&]oe=([0-9a-fA-F]+)(?:&|#|$)/)?.[1];
-    if (oe) return parseInt(oe, 16);
+const mediaLinkExpiry = (link: string): number | undefined => {
+  let values: string[];
+  try {
+    // A directPath has no host; the base only makes it parseable.
+    values = new URL(link, 'https://mmg.whatsapp.net').searchParams.getAll('oe');
+  } catch {
+    return undefined;
   }
-  return undefined;
+  const [oe] = values;
+  if (values.length !== 1 || !/^[0-9a-f]+$/i.test(oe)) return undefined;
+  const expiry = parseInt(oe, 16) * 1000;
+  return Number.isSafeInteger(expiry) ? expiry : undefined;
 };
 
 /**
  * A CDN answer that means the file has expired there, and only the phone still has it:
- * 404 or 410, or 403 on a link whose `oe` has passed. Measured on WhatsApp's media CDN
- * (2026-09-27, 84 history-sync attachments): 403 on 34 of 34 links whose `oe` had
- * passed and on 0 of 50 valid ones, where a valid link to a dropped file answered 404
- * or 410. So a 403 means the signed link expired; on a valid link it is not an expiry.
+ * 404 or 410, or 403 when the link that actually failed carries an `oe` that has passed
+ * by the local clock. That link is the url on Baileys' error (Boom data.url), else the
+ * one Baileys downloads: the directPath when there is one, else the url.
+ *
+ * The 403 rule is a conservative heuristic, not a documented contract. Measured on
+ * WhatsApp's media CDN (2026-09-27, 84 history-sync attachments): 403 on 34 of 34 links
+ * whose `oe` had passed and on 0 of 50 valid ones, where a valid link to a dropped file
+ * answered 404 or 410. A 403 without that evidence is not treated as an expiry, as a
+ * policy; a local clock that is off moves the line.
  */
-const isExpiredMedia = (error: any, media: Parameters<typeof mediaLinkExpiry>[0]) => {
+const isExpiredMedia = (error: any, media: { url?: string | null; directPath?: string | null } | undefined) => {
   const status = httpStatus(error);
   if (status === 404 || status === 410) return true;
   if (status !== 403) return false;
-  const expiry = mediaLinkExpiry(media);
-  return expiry !== undefined && expiry * 1000 <= Date.now();
+  const requested = error?.data?.url;
+  const link =
+    typeof requested === 'string' || requested instanceof URL ? requested.toString() : media?.directPath || media?.url;
+  const expiry = link ? mediaLinkExpiry(link) : undefined;
+  return expiry !== undefined && expiry <= Date.now();
 };
 
 /**
@@ -4626,7 +4640,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       };
       const target: WAMessage = { key: msg?.key, message: msg?.message };
-      // The link as first downloaded, whose `oe` says whether a 403 is an expired link.
+      // The links as first downloaded, for a 403 whose error does not name the one that failed.
       const link = { url: msg.message[mediaType]?.url, directPath: msg.message[mediaType]?.directPath };
       // No reuploadRequest for Baileys: Evolution asks the phone itself, below. Baileys
       // means to ask on a 404 or 410, but 7.0.0-rc14 checks error.status

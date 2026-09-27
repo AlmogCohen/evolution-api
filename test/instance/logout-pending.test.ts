@@ -315,6 +315,26 @@ describe('a logout that cannot reach WhatsApp', () => {
     expect({ logouts: sock.logouts, me: storedMe(), dir: existsSync(DIR) }).toEqual({ logouts: 1, me: [], dir: false });
   });
 
+  // The marker lives with the key files (INSTANCE_DIR); the row is in the database. If the files
+  // are lost, the row alone must keep the boot from bringing the instance back as a normal one.
+  it('is never undone by a lost marker file: the boot does not connect the instance', async () => {
+    const { service } = await waitingToReconnect();
+    expect(await call('DELETE', 'logout')).toEqual(PENDING);
+    service.stopReconnecting();
+    service.connect = async () => undefined;
+    socketSpy.mockClear();
+    rmSync(MARKER);
+
+    const monitor = await startProcess();
+    await vi.waitFor(() => expect(monitor.waInstances.test).toBeDefined());
+    await new Promise((r) => setTimeout(r, 1_500));
+    expect({
+      socketsBuilt: built().length,
+      emitted: emitted.map((e) => e.event),
+      state: monitor.waInstances.test.connectionStatus.state,
+    }).toEqual({ socketsBuilt: 0, emitted: [], state: 'close' });
+  });
+
   it('finishes when WhatsApp answers loggedOut on the reconnect (the device was already removed)', async () => {
     const { service } = await waitingToReconnect();
     expect(await call('DELETE', 'logout')).toEqual(PENDING);

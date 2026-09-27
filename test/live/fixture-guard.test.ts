@@ -17,7 +17,7 @@ vi.mock('@utils/fetchLatestWaWebVersion', () => ({
   fetchLatestWaWebVersion: async () => ({ version: [2, 3000, 1], isLatest: true }),
 }));
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -56,7 +56,11 @@ describe('live fixture guard', () => {
       { seq: 5, event: 'contacts.update', data: [{ about: `write to ${PLANTED.email}` }] },
       { seq: 6, event: 'messages.upsert', data: { mediaKey: { $bytes: PLANTED.bytes, as: 'Uint8Array' } } },
       { seq: 7, event: 'messages.upsert', data: { jpegThumbnail: PLANTED.bytes } },
-      { seq: 8, event: 'presence.update', data: { presences: { [PLANTED.pnJid]: { lastKnownPresence: 'available' } } } },
+      {
+        seq: 8,
+        event: 'presence.update',
+        data: { presences: { [PLANTED.pnJid]: { lastKnownPresence: 'available' } } },
+      },
     ];
     writeFileSync(join(dir, 'events.ndjson'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
     writeFileSync(join(dir, 'manifest.json'), JSON.stringify({ note: `owner ${PLANTED.phone}` }));
@@ -84,8 +88,72 @@ describe('live fixture guard', () => {
     }
   });
 
+  it('reads a long camelCase identifier as a name, not a base64 blob', () => {
+    const dir = join(root, 'live', '2026-09-27-identifiers');
+    mkdirSync(dir, { recursive: true });
+    const lines = [
+      // Baileys' own key names: creds keys, proto fields.
+      { seq: 1, event: 'connection.update', data: { receivedPendingNotifications: true } },
+      {
+        seq: 2,
+        event: 'creds.update',
+        data: { $redacted: 'creds', keys: ['processedHistoryMessages', 'lastAccountSyncTimestamp'] },
+      },
+      { seq: 3, event: 'messages.upsert', data: { message: { axolotlSenderKeyDistributionMessage: {} } } },
+      // A blob of letters only, not identifier-shaped, is still a blob.
+      {
+        seq: 4,
+        event: 'messages.upsert',
+        data: { thumb: 'QmFzZVNpeHRyRmxvYkxldHRlcnNPbmxWWFpBQkNE' },
+      },
+    ];
+    writeFileSync(join(dir, 'events.ndjson'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+    const findings = scanFixtures(join(root, 'live'));
+    expect(findings.filter((f) => f.line <= 3)).toEqual([]);
+    expect(findings).toContainEqual(expect.objectContaining({ line: 4, kind: 'base64 blob' }));
+  });
+
+  it("accepts the scrubber's fake numeric message id, and nothing else numeric under an id", () => {
+    const dir = join(root, 'live', '2026-09-27-numeric-ids');
+    mkdirSync(dir, { recursive: true });
+    const stub = (seq: number, id: string) => ({
+      seq,
+      event: 'messages.upsert',
+      data: { messages: [{ key: { remoteJid: '120363000000000001@g.us', id }, messageStubType: 20 }] },
+    });
+    const lines = [stub(1, '740000002'), stub(2, '4100000013'), stub(3, PLANTED.phone), stub(4, '834726190')];
+    writeFileSync(join(dir, 'events.ndjson'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+    const flagged = scanFixtures(join(root, 'live')).map((f) => `${f.line} ${f.kind}`);
+    expect(flagged).toEqual(['3 phone-like digit run', '4 phone-like digit run']);
+  });
+
   it('passes the scrubber output of a recorded session', async () => {
     const raw = await recordSession(join(root, 'raw'));
+    // Group notifications carry numeric message ids; the creds keys are long identifiers.
+    const extra = [
+      {
+        seq: 998,
+        t: 1,
+        socket: 1,
+        event: 'creds.update',
+        buffered: false,
+        data: { $redacted: 'creds', keys: ['processedHistoryMessages'] },
+      },
+      {
+        seq: 999,
+        t: 1,
+        socket: 1,
+        event: 'messages.upsert',
+        buffered: false,
+        data: {
+          type: 'append',
+          messages: [
+            { key: { remoteJid: '120363401234567890@g.us', fromMe: false, id: '834726190' }, messageStubType: 20 },
+          ],
+        },
+      },
+    ];
+    appendFileSync(join(raw, 'events.ndjson'), extra.map((l) => JSON.stringify(l)).join('\n') + '\n');
     scrubSession(raw, { checkId: 'synthetic-session', date: '2026-09-27', outRoot: join(root, 'live') });
     expect(formatFindings(scanFixtures(join(root, 'live')))).toBe('');
   });

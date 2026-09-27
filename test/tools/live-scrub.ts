@@ -13,7 +13,7 @@
 //   phone JID / @lid / group        972500<6> / 100000000<6> / 120363<12>, device suffix kept; index 0 is the owner
 //   a bare number of 7-15 digits    the same person's fake digits (epoch timestamps are kept)
 //   a name (name, notify, pushName, subject...)  "Name <n>", one per distinct original ("Você" kept)
-//   a message id                    same first two characters and length, the rest a counter
+//   a message id                    same first two characters and length, the rest a counter (digits stay digits)
 //   bytes ($bytes)                  random bytes of the same length and type, tagged fake
 //   a URL                           https://example.invalid/<n>
 //   structure (event names, enums, mimetypes, dates, 3 characters or fewer)   kept
@@ -170,6 +170,8 @@ class Scrubber {
     if (s === this.instanceName && (key === 'instance' || key === 'instanceName')) return REPLAY_INSTANCE;
     const jid = JID.exec(s);
     if (jid) return this.fakeJid(jid[1], jid[2], jid[3]);
+    // A numeric message id (group notifications have them) is an id, not a person.
+    if (ID_KEYS.has(key) && /^\d{7,}$/.test(s) && !this.digits.has(s)) return this.fakeId(s);
     if (/^\+?\d{7,15}$/.test(s)) {
       const plus = s.startsWith('+') ? '+' : '';
       const digits = s.slice(plus.length);
@@ -214,6 +216,7 @@ class Scrubber {
 
   private fakeId(s: string) {
     return this.memo(this.ids, s, (n) => {
+      if (/^\d+$/.test(s)) return s.slice(0, 2) + String(n).padStart(s.length - 2, '9').slice(-(s.length - 2));
       const body = n
         .toString(16)
         .toUpperCase()

@@ -10,15 +10,43 @@ import P from 'pino';
 import { makeService } from './baileys-service';
 
 export function fakeSocket() {
-  return {
-    ev: makeEventBuffer(P({ level: 'silent' }) as any),
+  const ev = makeEventBuffer(P({ level: 'silent' }) as any);
+  // ev.process subscriptions still attached: a socket Evolution has let go of should have none.
+  let handlers = 0;
+  const process = ev.process.bind(ev);
+  ev.process = (handler: any) => {
+    const off = process(handler);
+    handlers++;
+    let attached = true;
+    return () => {
+      if (attached) handlers--;
+      attached = false;
+      off();
+    };
+  };
+  let closed = false;
+  ev.on('connection.update', (update: any) => {
+    if (update.connection === 'close') closed = true;
+  });
+  const sock = {
+    ev,
     ws: Object.assign(new EventEmitter(), { close: () => undefined }),
     // connectionUpdate reads the account on 'open', and logoutInstance logs the socket out.
     user: { id: '972500000000:1@s.whatsapp.net' },
     profilePictureUrl: async () => undefined,
     logout: async () => undefined,
-    end: () => undefined,
+    /** Whether Evolution called end() on this socket. */
+    ended: false,
+    handlers: () => handlers,
+    // As Baileys' end() (Socket/socket.js): once only, and it announces the close on the socket's own events.
+    end: (error?: Error) => {
+      sock.ended = true;
+      if (closed) return;
+      closed = true;
+      ev.emit('connection.update', { connection: 'close', lastDisconnect: { error, date: new Date() } });
+    },
   };
+  return sock;
 }
 
 /** The auth state is files on disk under the instances directory; nothing about it touches the network. */

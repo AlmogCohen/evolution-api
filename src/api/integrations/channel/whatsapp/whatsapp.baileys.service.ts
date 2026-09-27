@@ -114,6 +114,7 @@ import makeWASocket, {
   getContentType,
   getDevice,
   GroupMetadata,
+  GroupParticipant,
   isJidBroadcast,
   isJidGroup,
   isJidNewsletter,
@@ -2140,19 +2141,18 @@ export class BaileysStartupService extends ChannelStartupService {
 
     'group-participants.update': async (participantsUpdate: {
       id: string;
-      participants: string[];
+      participants: (GroupParticipant | string)[];
       action: ParticipantAction;
     }) => {
       // ENHANCEMENT: Adds participantsData field while maintaining backward compatibility
-      // MAINTAINS: participants: string[] (original JID strings)
-      // ADDS: participantsData: { jid: string, phoneNumber: string, name?: string, imgUrl?: string }[]
+      // MAINTAINS: participants, exactly as Baileys emitted it
+      // ADDS: participantsData: { jid: string, phoneNumber?: string, name?: string, imgUrl?: string }[]
       // This enables LID to phoneNumber conversion without breaking existing webhook consumers
-
-      // Helper to normalize participantId as phone number
-      const normalizePhoneNumber = (id: string | null | undefined): string => {
-        // Remove @lid, @s.whatsapp.net suffixes and extract just the number part
-        return String(id || '').split('@')[0];
-      };
+      //
+      // Baileys 7 emits each participant as a GroupParticipant object ({ id, phoneNumber?, ... });
+      // Baileys 6 emitted jid strings. phoneNumber is a phone jid (<number>@s.whatsapp.net): the
+      // participant's own, else the group metadata's, else the LID mapping store's, else none.
+      const phoneJid = (jid: string | null | undefined) => (isPnUser(jid) ? jidNormalizedUser(jid) : undefined);
 
       try {
         // Usa o mesmo método que o endpoint /group/participants
@@ -2164,28 +2164,34 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         // Filtra apenas os participantes que estão no evento
-        const resolvedParticipants = participantsUpdate.participants.map((participantId) => {
-          const participantData = groupParticipants.participants.find((p) => p.id === participantId);
+        const resolvedParticipants = await Promise.all(
+          participantsUpdate.participants.map(async (participant) => {
+            const jid = typeof participant === 'string' ? participant : participant?.id;
+            const participantData = groupParticipants.participants.find((p) => p.id === jid);
 
-          let phoneNumber: string;
-          if (participantData?.phoneNumber) {
-            phoneNumber = participantData.phoneNumber;
-          } else {
-            phoneNumber = normalizePhoneNumber(participantId);
-          }
+            let phoneNumber =
+              phoneJid(typeof participant === 'string' ? undefined : participant?.phoneNumber) ??
+              phoneJid(participantData?.phoneNumber) ??
+              phoneJid(jid);
+            if (!phoneNumber && isLidUser(jid)) {
+              phoneNumber = phoneJid(
+                await this.client.signalRepository?.lidMapping?.getPNForLID(jid).catch((): undefined => undefined),
+              );
+            }
 
-          return {
-            jid: participantId,
-            phoneNumber,
-            name: participantData?.name,
-            imgUrl: participantData?.imgUrl,
-          };
-        });
+            return {
+              jid,
+              phoneNumber,
+              name: participantData?.name,
+              imgUrl: participantData?.imgUrl,
+            };
+          }),
+        );
 
         // Mantém formato original + adiciona dados resolvidos
         const enhancedParticipantsUpdate = {
           ...participantsUpdate,
-          participants: participantsUpdate.participants, // Mantém array original de strings
+          participants: participantsUpdate.participants, // Mantém o array original, como o Baileys emitiu
           // Adiciona dados resolvidos em campo separado
           participantsData: resolvedParticipants,
         };

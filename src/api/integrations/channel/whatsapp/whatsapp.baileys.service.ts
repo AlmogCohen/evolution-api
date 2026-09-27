@@ -529,6 +529,12 @@ export class BaileysStartupService extends ChannelStartupService {
         AND "key"->>'id' = ${key.id}
       `) as proto.IWebMessageInfo[];
 
+      // Not stored: answer undefined. Baileys calls this to answer a retry request
+      // and relays any truthy answer; only a falsy one means "not available".
+      if (!webMessageInfo?.length) {
+        return undefined;
+      }
+
       if (full) {
         return webMessageInfo[0];
       }

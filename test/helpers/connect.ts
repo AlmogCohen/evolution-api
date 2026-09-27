@@ -4,12 +4,13 @@
 // makeWASocket is `socketSpy`, which returns fakeSocket().
 import { EventEmitter } from 'node:events';
 
+import { Boom } from '@hapi/boom';
 import { initAuthCreds, makeEventBuffer } from 'baileys';
 import P from 'pino';
 
 import { makeService } from './baileys-service';
 
-export function fakeSocket() {
+export function fakeSocket(config?: any) {
   const ev = makeEventBuffer(P({ level: 'silent' }) as any);
   // ev.process subscriptions still attached: a socket Evolution has let go of should have none.
   let handlers = 0;
@@ -25,8 +26,10 @@ export function fakeSocket() {
     };
   };
   let closed = false;
+  let open = false;
   ev.on('connection.update', (update: any) => {
     if (update.connection === 'close') closed = true;
+    if (update.connection === 'open') open = true;
   });
   const sock = {
     ev,
@@ -34,7 +37,17 @@ export function fakeSocket() {
     // connectionUpdate reads the account on 'open', and logoutInstance logs the socket out.
     user: { id: '972500000000:1@s.whatsapp.net' },
     profilePictureUrl: async () => undefined,
-    logout: async () => undefined,
+    /** How many times the socket told WhatsApp to remove this device (remove-companion-device). */
+    logouts: 0,
+    // As Baileys' logout(): with a linked device it first tells WhatsApp, which throws when the ws is
+    // not open (sendNode: 'Connection Closed'); then it ends the socket with loggedOut.
+    logout: async (msg?: string) => {
+      if (config?.auth?.creds?.me?.id) {
+        if (!open || closed) throw new Boom('Connection Closed', { statusCode: 428 });
+        sock.logouts++;
+      }
+      sock.end(new Boom(msg || 'Intentional Logout', { statusCode: 401 }));
+    },
     /** Whether Evolution called end() on this socket. */
     ended: false,
     handlers: () => handlers,

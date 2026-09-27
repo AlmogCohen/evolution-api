@@ -1,5 +1,5 @@
-// Unlinking an instance (DELETE /instance/logout, DELETE /instance/delete) must
-// unlink it even when its socket is down. Baileys' logout first sends
+// Unlinking an instance (DELETE /instance/logout, DELETE /instance/delete) whose
+// socket is down. Baileys' logout first sends
 // remove-companion-device, and sendRawMessage throws Boom('Connection Closed',
 // 428) when the ws is not open (rc14 lib/Socket/socket.js, sendRawMessage),
 // before logout ends the socket. 2.3.7's logoutInstance awaits it unguarded, so
@@ -8,6 +8,12 @@
 // Evolution then connects with the kept credentials (the socket in flight, or the
 // boot auto-connect of a row that says open) and keeps receiving the person's
 // messages after they unlinked.
+//
+// Wiping the credentials locally instead (what this file first required) is no
+// better: without them the device can never tell WhatsApp to remove it, so it
+// stays on the person's Linked devices. So the logout is kept pending until the
+// connection returns (test/instance/logout-pending.test.ts has the delivery):
+// the credentials stay, a marker says it is pending, and the answer says so.
 //
 // The instance here is mid-reconnect, the way it is after a dropped connection:
 // Evolution's real connect builds a real Baileys socket, pointed at a local
@@ -94,9 +100,13 @@ beforeAll(async () => {
 });
 afterEach(async () => {
   // Tear down without the service answering the close with a reconnect.
-  for (const service of h.services) service.connectToWhatsapp = async () => undefined;
+  for (const service of h.services) {
+    service.connectToWhatsapp = async () => undefined;
+    service.connect = async () => undefined;
+  }
   for (const s of h.sockets) await s.end(undefined).catch(() => undefined);
   for (const service of h.services) await settle(service);
+  for (const service of h.services) service.stopReconnecting();
   whatsapp.drop();
   h.sockets.length = 0;
   h.services.length = 0;
@@ -160,30 +170,44 @@ async function expectUnlinked(service: any) {
   expect(h.sockets.map((s) => s.ws.isClosed)).toEqual([true]);
 }
 
+/** The logout is pending: the session is kept, marked pending, and its socket is still dialling to deliver it. */
+async function expectPending() {
+  expect(JSON.parse(JSON.parse(prisma.session.rows[0].creds)).me.id).toBe(WUID);
+  expect(readdirSync(join(tmp, 'inst-1')).sort()).toEqual(['logout-pending.json', 'pre-key-1.json']);
+  expect(h.sockets.map((s) => s.ws.isConnecting)).toEqual([true]);
+}
+
 describe('unlinking an instance whose connection is down', () => {
-  it('logout wipes the session, ends the socket, and the instance stays down', async () => {
+  it('logout keeps the session and answers that the logout is pending', async () => {
     const { service } = await reconnectingInstance();
 
     expect(await call('logout')).toEqual({
-      status: 200,
-      body: { status: 'SUCCESS', error: false, response: { message: 'Instance logged out' } },
+      status: 202,
+      body: {
+        status: 'PENDING',
+        error: false,
+        response: { message: 'Logout pending: WhatsApp will be told when the connection returns' },
+      },
     });
 
-    await expectUnlinked(service);
-    // The boot auto-connects only a row that says open or connecting (monitor.service.ts setInstance).
-    expect(prisma.instance.rows.map((r: any) => r.connectionStatus)).toEqual(['close']);
-    expect(service.connectionStatus.state).toBe('close');
+    await settle(service);
+    await expectPending();
   });
 
-  it('delete wipes the session and removes the instance', async () => {
+  it('delete removes the instance from the API and keeps the session for the logout', async () => {
     const { service, waMonitor } = await reconnectingInstance();
 
     expect(await call('delete')).toEqual({
-      status: 200,
-      body: { status: 'SUCCESS', error: false, response: { message: 'Instance deleted' } },
+      status: 202,
+      body: {
+        status: 'PENDING',
+        error: false,
+        response: { message: 'Instance deleted; its logout will reach WhatsApp when the connection returns' },
+      },
     });
 
-    await expectUnlinked(service);
+    await settle(service);
+    await expectPending();
     expect(waMonitor.waInstances.test).toBeUndefined();
     expect(prisma.instance.rows).toEqual([]);
   });

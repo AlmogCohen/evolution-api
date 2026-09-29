@@ -12,6 +12,8 @@ WORKDIR /evolution
 COPY ./package*.json ./
 COPY ./tsconfig.json ./
 COPY ./tsup.config.ts ./
+# npm ci's postinstall (patch-package) applies these to node_modules.
+COPY ./patches ./patches
 
 RUN npm ci --silent
 

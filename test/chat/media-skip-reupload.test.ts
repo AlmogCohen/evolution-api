@@ -153,10 +153,15 @@ describe('a media download can skip asking the phone to re-upload', () => {
     expect(asked).toEqual([]);
     // The first GET is the download; Evolution's own fallback then tries mmg.whatsapp.net, refused here.
     expect(cdn.log).toEqual([`GET ${VALID_LINK_403}`]);
-    // Its answer is that fallback's own failure, not the "no longer on WhatsApp's servers" 400.
+    // Its answer is that fallback's own failure, not the "no longer on WhatsApp's servers" 400: what
+    // kind of error and its network code, never its text (media-error-no-url.test.ts).
     expect(answer).toEqual({
       status: 400,
-      body: { status: 400, error: 'Bad Request', response: { message: ['TypeError: fetch failed'], reupload: 'not_requested' } },
+      body: {
+        status: 400,
+        error: 'Bad Request',
+        response: { message: ['The media could not be downloaded (TypeError, UND_MOCK_ERR_MOCK_NOT_MATCHED)'], reupload: 'not_requested' },
+      },
     });
   });
 

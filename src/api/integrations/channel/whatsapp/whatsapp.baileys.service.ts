@@ -75,15 +75,21 @@ import {
   QrCode,
   S3,
 } from '@config/env.config';
+import { INSTANCE_DIR } from '@config/path.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
-import { Instance, Message } from '@prisma/client';
+import { Instance, Message, Prisma } from '@prisma/client';
+import { chatState } from '@utils/chat-state';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
+import { LiveRecorder } from '@utils/live-record/recorder';
+import { errorFields, jidKind, makeBaileysLogger } from '@utils/log-privacy';
+import { readLogoutMarker, writeLogoutMarker } from '@utils/logout-marker';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
+import { QueryLimiter } from '@utils/queryLimiter';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
@@ -110,9 +116,11 @@ import makeWASocket, {
   getContentType,
   getDevice,
   GroupMetadata,
+  GroupParticipant,
   isJidBroadcast,
   isJidGroup,
   isJidNewsletter,
+  isLidUser,
   isPnUser,
   jidNormalizedUser,
   makeCacheableSignalKeyStore,
@@ -123,6 +131,7 @@ import makeWASocket, {
   prepareWAMessageMedia,
   Product,
   proto,
+  S_WHATSAPP_NET,
   UserFacingSocketConfig,
   WABrowserDescription,
   WAMediaUpload,
@@ -139,13 +148,13 @@ import { createHash } from 'crypto';
 import EventEmitter2 from 'eventemitter2';
 import ffmpeg from 'fluent-ffmpeg';
 import FormData from 'form-data';
+import { rmSync } from 'fs';
 import Long from 'long';
 import mimeTypes from 'mime-types';
 import NodeCache from 'node-cache';
 import cron from 'node-cron';
 import { release } from 'os';
 import { join } from 'path';
-import P from 'pino';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import sharp from 'sharp';
@@ -224,6 +233,139 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+/**
+ * A media key as bytes. A message that arrives over HTTP JSON carries it as a base64
+ * string, the index-keyed object JSON makes of a Uint8Array, or the {type:'Buffer', data}
+ * it makes of a Buffer. Baileys' download reads a base64 string itself, but its re-upload
+ * (updateMediaMessage: encryptMediaRetryRequest, decryptMediaRetryData) derives the retry
+ * key from the value as given, and then cannot decrypt the phone's answer.
+ */
+const mediaKeyBytes = (value: any): Buffer => {
+  if (typeof value === 'string') return Buffer.from(value.replace('data:;base64,', ''), 'base64');
+  if (value instanceof Uint8Array) return Buffer.from(value);
+  if (value?.type === 'Buffer' && Array.isArray(value.data)) return Buffer.from(value.data);
+  return Buffer.from(Object.values(value) as number[]);
+};
+
+/** Whether a media download asked the phone to re-upload an expired file, and how that ended. */
+type MediaReupload = 'not_requested' | 'ok' | 'failed';
+
+/** The HTTP status a Baileys media error carries (a Boom's output.statusCode), or 'none'. */
+const httpStatus = (error: any) => error?.output?.statusCode ?? error?.status ?? 'none';
+
+/** What kind of error was thrown, never what it says: a thrown string is 'string'. */
+const errorName = (error: any): string =>
+  typeof error === 'string' ? 'string' : typeof error?.name === 'string' ? error.name.slice(0, 40) : 'unknown';
+
+/**
+ * Why the phone refused a re-upload, from the error Baileys' updateMediaMessage threw:
+ * the phone's MediaRetryNotification result (NOT_FOUND, DECRYPTION_ERROR, GENERAL_ERROR),
+ * error_<code> for an <error> answer, missing_ciphertext for an answer with neither,
+ * no_answer when it did not answer in time, else unknown. Never content or a JID.
+ */
+const reuploadRefusal = (error: any): string => {
+  if (error?.name === 'ReuploadTimeoutError') return 'no_answer';
+  const result = error?.data?.result;
+  if (typeof result === 'number') return proto.MediaRetryNotification.ResultType[result] ?? `result_${result}`;
+  const code = String(error?.data?.code ?? '');
+  if (/^\d{1,6}$/.test(code)) return `error_${code}`;
+  if (error?.message === 'Failed to re-upload media (missing ciphertext)') return 'missing_ciphertext';
+  return 'unknown';
+};
+
+/**
+ * What a failed media download answers with, instead of the error's own text. Baileys'
+ * download error says "Failed to fetch stream from <the link>" and carries the link (Boom
+ * data.url); a WhatsApp media link is signed per message (oh, oe, the _nc_ parameters), so
+ * whoever holds it can fetch the file, and even its directPath alone names the file. So the
+ * answer says what failed and never where: the CDN's HTTP status, else the kind of error and
+ * its network code. A text Evolution threw itself (it names no link) stands, as does the
+ * message of an answer already built here (the MP4 conversion's 400).
+ */
+const mediaDownloadFailure = (error: any): string => {
+  if (typeof error === 'string') return error;
+  if (!(error instanceof Error) && Array.isArray(error?.message) && typeof error.message[0] === 'string') {
+    return error.message[0];
+  }
+  const status = httpStatus(error);
+  if (typeof status === 'number') return `The media could not be downloaded (HTTP ${status})`;
+  const code = error?.cause?.code ?? error?.code;
+  const network = typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,40}$/.test(code) ? `, ${code}` : '';
+  return `The media could not be downloaded (${errorName(error)}${network})`;
+};
+
+/**
+ * When a WhatsApp media link stops working, in ms: its `oe` query parameter (hex unix
+ * seconds). Read with URLSearchParams, so the name is case-sensitive, the value is
+ * percent-decoded and a fragment never counts. Undefined unless the query carries exactly
+ * one `oe` and it is plain hex.
+ */
+const mediaLinkExpiry = (link: string): number | undefined => {
+  let values: string[];
+  try {
+    // A directPath has no host; the base only makes it parseable.
+    values = new URL(link, 'https://mmg.whatsapp.net').searchParams.getAll('oe');
+  } catch {
+    return undefined;
+  }
+  const [oe] = values;
+  if (values.length !== 1 || !/^[0-9a-f]+$/i.test(oe)) return undefined;
+  const expiry = parseInt(oe, 16) * 1000;
+  return Number.isSafeInteger(expiry) ? expiry : undefined;
+};
+
+/**
+ * A CDN answer that means the file has expired there, and only the phone still has it:
+ * 404 or 410, or 403 when the link that actually failed carries an `oe` that has passed
+ * by the local clock. That link is the url on Baileys' error (Boom data.url), else the
+ * one Baileys downloads: the directPath when there is one, else the url.
+ *
+ * The 403 rule is a conservative heuristic, not a documented contract. Measured on
+ * WhatsApp's media CDN (2026-09-27, 84 history-sync attachments): 403 on 34 of 34 links
+ * whose `oe` had passed and on 0 of 50 valid ones, where a valid link to a dropped file
+ * answered 404 or 410. A 403 without that evidence is not treated as an expiry, as a
+ * policy; a local clock that is off moves the line.
+ */
+const isExpiredMedia = (error: any, media: { url?: string | null; directPath?: string | null } | undefined) => {
+  const status = httpStatus(error);
+  if (status === 404 || status === 410) return true;
+  if (status !== 403) return false;
+  const requested = error?.data?.url;
+  const link =
+    typeof requested === 'string' || requested instanceof URL ? requested.toString() : media?.directPath || media?.url;
+  const expiry = link ? mediaLinkExpiry(link) : undefined;
+  return expiry !== undefined && expiry <= Date.now();
+};
+
+/**
+ * How long the phone gets to answer a re-upload request. Baileys' updateMediaMessage
+ * waits for the answer with no timeout of its own, so this is its default query
+ * timeout (defaultQueryTimeoutMs).
+ */
+export const MEDIA_REUPLOAD_TIMEOUT_MS = 60_000;
+
+/** A socket build stopped because the instance was shut down meanwhile. */
+class ConnectAborted extends Error {
+  constructor() {
+    super('The instance was shut down while its connection was being built');
+    this.name = 'ConnectAborted';
+  }
+}
+
+/** The pending logout recordPending wrote on an instance's row (disconnectionObject), if there is one. */
+const pendingOnRow = (value: unknown): { deleted: boolean } | undefined => {
+  let object: any = value;
+  if (typeof object === 'string') {
+    try {
+      object = JSON.parse(object);
+    } catch {
+      return undefined;
+    }
+  }
+  const pending = object?.logoutPending;
+  return pending && typeof pending === 'object' ? { deleted: !!pending.deleted } : undefined;
+};
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
 
@@ -249,27 +391,398 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly msgRetryCounterCache: CacheStore = new NodeCache();
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
+  // A reconnectable close is retried after 1s, 2s, 4s... doubling to one a minute, for as long as
+  // it takes: an instance that gave up would sit disconnected on valid credentials. An open resets it.
+  private static readonly RECONNECT_FIRST_DELAY_MS = 1_000;
+  private static readonly RECONNECT_MAX_DELAY_MS = 60_000;
+  // How long WhatsApp gets to answer a remove-companion-device before the next connection is asked
+  // instead; under logoutInstance's own 10s, so a logout that goes unanswered answers 202.
+  private static readonly REMOVE_ANSWER_TIMEOUT_MS = 8_000;
+  private reconnectAttempts = 0;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  // The connect under way, so a second one joins it instead of building a second socket.
+  private connecting: { number: string | null; socket: Promise<WASocket> } | null = null;
+  // Stops Evolution listening to the current socket; called before that socket is ended.
+  private detachClient?: () => void;
+  // A logout under way. Until it is done the instance forwards and stores nothing, and it connects
+  // only to tell WhatsApp. `marked`: it could not reach WhatsApp, so it is pending, recorded on the
+  // instance's row (`recorded`, what a 202 promises: it survives a restart and the loss of the
+  // instances volume) and in a marker file (utils/logout-marker.ts). `deleted`: the instance has
+  // left the API.
+  private logout: {
+    marked: boolean;
+    deleted: boolean;
+    recorded?: boolean;
+    settle: (outcome: 'done' | 'pending') => void;
+  } | null = null;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  // Records this session's events and webhooks for a live check; undefined unless LIVE_RECORD_DIR is set.
+  private liveRecorder?: LiveRecorder;
+  // The dispatcher media downloads go through: the instance's proxy, the same exit as the socket.
+  private mediaProxy?: { key: string; dispatcher: ReturnType<typeof makeProxyAgentUndici> };
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
 
+  // Profile pictures seen by the event handlers: one IQ per jid per hour, a few
+  // in flight at once. Every contacts.upsert, contacts.update and inbound message
+  // used to ask WhatsApp again, which at link time is thousands of IQs in a
+  // burst. WhatsApp's picture notification (contacts.update imgUrl) refreshes it.
+  private readonly PICTURE_TTL_MS = 60 * 60 * 1000;
+  private readonly pictureCache = new Map<string, { url: string | null; at: number }>();
+  private readonly pictureLookups = new Map<string, { bulk: boolean; lookup: Promise<string | null> }>();
+  // Lookups the event handlers start on their own (pictures, group metadata refreshes): four at a time.
+  private readonly backgroundQueries = new QueryLimiter(4);
+  private readonly groupRefreshes = new Map<string, Promise<GroupMetadata | null>>();
+
   public stateConnection: wa.StateConnection = { state: 'close' };
 
   public phoneNumber: string;
+
+  // The socket a pairing code was requested on. Baileys' requestPairingCode makes
+  // a new code and pushes a notification to the phone, so it is asked once per
+  // socket, not on every QR refresh (which would kill the code being typed).
+  private pairingCodeSocket?: WASocket;
 
   public get connectionStatus() {
     return this.stateConnection;
   }
 
-  public async logoutInstance() {
+  /**
+   * Log the device out on WhatsApp's side (remove-companion-device, which takes it off the person's
+   * Linked devices), then wipe the session. That needs an open socket and the credentials, so when
+   * the socket is down or waiting to reconnect the credentials are kept and the logout is pending
+   * until the connection returns: 'pending'. A session that is not linked has nothing to tell
+   * WhatsApp and is wiped at once.
+   */
+  public async logoutInstance(): Promise<'done' | 'pending'> {
+    // One logout at a time: a second call (another client, a delete) waits for the one under way and
+    // answers with its outcome. Installed before any wait, so two calls can never both start one.
+    this.logoutRun ??= this.runLogout().finally(() => (this.logoutRun = null));
+    const result = await this.logoutRun;
+    // A 202 promises the logout survives a restart: when that cannot be recorded, the caller hears
+    // it, and every call tries again.
+    if (result === 'pending') await this.recordPending();
+    return result;
+  }
+
+  private logoutRun: Promise<'done' | 'pending'> | null = null;
+
+  private async runLogout(): Promise<'done' | 'pending'> {
+    // A connect under way finishes first, so the socket logged out is the one it builds.
+    await this.connecting?.socket.catch(() => undefined);
+    if (this.logout?.marked) return 'pending';
+
+    const linked = await this.hasLinkedSession();
     this.messageProcessor.onDestroy();
-    await this.client?.logout('Log out instance: ' + this.instanceName);
+    this.pictureCache.clear();
+    const socketClosed = this.stateConnection.state === 'close';
+    const outcome = new Promise<'done' | 'pending'>(
+      (settle) => (this.logout = { marked: false, deleted: false, settle }),
+    );
 
-    this.client?.ws?.close();
+    if (linked) {
+      try {
+        if (this.stateConnection.state !== 'open') throw new Error('the connection is not open');
+        // Confirmed: the socket ends with loggedOut, which finishes it. Not: it ends with a code that
+        // reconnects, and the logout is pending until the next connection says (logoutUpdate).
+        await this.removeFromWhatsApp();
+      } catch (error) {
+        this.logger.warn(`Logout could not reach WhatsApp (${error?.message}): pending until the connection returns`);
+        await this.markLogoutPending();
+      }
+    } else {
+      this.stopReconnecting();
+      try {
+        // Nothing to tell WhatsApp: Baileys only ends the socket, with loggedOut.
+        await this.client?.logout('Log out instance: ' + this.instanceName);
+      } catch {
+        // No socket to end.
+      }
+      // A socket that had already closed announces nothing when ended.
+      if (socketClosed) await this.finishLogout();
+    }
 
+    // The loggedOut close normally follows at once; if it never comes, keep the session (pending).
+    let timer: NodeJS.Timeout;
+    const late = new Promise<'late'>((r) => (timer = setTimeout(() => r('late'), 10_000)));
+    const result = await Promise.race([outcome, late]);
+    clearTimeout(timer);
+    if (result === 'late') {
+      await this.markLogoutPending();
+      return 'pending';
+    }
+    return result;
+  }
+
+  /** Whether a logout is pending (it could not reach WhatsApp yet). */
+  public get logoutPending() {
+    return !!this.logout?.marked;
+  }
+
+  /**
+   * The instance was deleted while its logout is pending: it finishes out of the API, then removes
+   * the rest. Throws, changing nothing, when that cannot be recorded on its row.
+   */
+  public async markLogoutDeleted() {
+    if (!this.logout) return;
+    this.logout.deleted = true;
+    this.logout.recorded = false;
+    try {
+      await this.recordPending();
+    } catch (error) {
+      this.logout.deleted = false;
+      this.logout.recorded = false;
+      throw error;
+    }
+    await this.writeMarker();
+  }
+
+  /**
+   * A logout that was pending when the process stopped: from the marker file, else from the row
+   * (the instances volume can be lost; the row and the creds are in the database).
+   */
+  public async pendingLogout(): Promise<{ deleted: boolean } | undefined> {
+    const marker = readLogoutMarker(this.instanceId);
+    if (marker) return { deleted: !!marker.deleted };
+    try {
+      const row = await this.prismaRepository.instance.findUnique({ where: { id: this.instanceId } });
+      return pendingOnRow(row?.disconnectionObject);
+    } catch (error) {
+      this.logger.error({ message: 'Could not read whether a logout is pending', error: errorFields(error) });
+      return undefined;
+    }
+  }
+
+  /** On boot: an instance with a pending logout connects only to finish it. Returns whether it had one. */
+  public async resumePendingLogout(pending?: { deleted: boolean }): Promise<boolean> {
+    pending ??= await this.pendingLogout();
+    if (!pending) return false;
+    this.logout = { marked: true, deleted: pending.deleted, recorded: true, settle: () => undefined };
+    this.logger.info(`Resuming a pending logout for instance "${this.instance.name}"`);
+    try {
+      await this.connect(this.phoneNumber);
+    } catch (error) {
+      this.logger.error({ message: 'Connect for a pending logout failed', error: errorFields(error?.cause ?? error) });
+      this.scheduleReconnect();
+    }
+    return true;
+  }
+
+  /** Whether logging out an instance that is not connected has anything to do. */
+  public async hasSessionToLogOut(): Promise<boolean> {
+    if (this.reconnectTimer || this.connecting) return true;
+    return this.hasLinkedSession();
+  }
+
+  /**
+   * The instance is removed from the API: no reconnect, its socket let go of without its close being
+   * handled, and no socket built after this, including one being built now (createClient checks).
+   */
+  public shutdown() {
+    this.shutDown = true;
+    this.stopReconnecting();
+    this.retireClient();
+  }
+
+  private shutDown = false;
+
+  /** A socket build stops at its next step once the instance is shut down. */
+  private stillWanted() {
+    if (this.shutDown) throw new ConnectAborted();
+  }
+
+  /** Whether the stored session is a linked device (creds carry `me`), i.e. whether WhatsApp has something to remove. */
+  private async hasLinkedSession(): Promise<boolean> {
+    const cache = this.configService.get<CacheConf>('CACHE');
+    const provider = this.configService.get<ProviderSession>('PROVIDER');
+    const db = this.configService.get<Database>('DATABASE');
+    if (provider?.ENABLED || (cache?.REDIS.ENABLED && cache?.REDIS.SAVE_INSTANCES) || !db.SAVE_DATA.INSTANCE) {
+      return !!this.instance.authState?.state?.creds?.me?.id;
+    }
+    const row = await this.prismaRepository.session.findFirst({ where: { sessionId: this.instanceId } });
+    let creds: any = row?.creds;
+    while (typeof creds === 'string') creds = JSON.parse(creds);
+    return !!creds?.me?.id;
+  }
+
+  private async writeMarker() {
+    try {
+      await writeLogoutMarker(this.instanceId, {
+        instanceName: this.instance.name,
+        deleted: !!this.logout?.deleted,
+        since: new Date().toISOString(),
+      });
+    } catch (error) {
+      // Still pending in this process; only a restart before it is delivered would lose it.
+      this.logger.error({ message: 'Could not write the logout marker', error: error?.toString() });
+    }
+  }
+
+  /**
+   * Record the pending logout on the instance's row, where the boot finds it even without the
+   * marker file, and where the creds it needs are. Throws when it cannot: a 202 must not promise
+   * what a restart would forget.
+   */
+  private async recordPending() {
+    const logout = this.logout;
+    if (!logout?.marked || logout.recorded) return;
+    await this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: {
+        connectionStatus: 'close',
+        disconnectionAt: new Date(),
+        disconnectionObject: { logoutPending: { deleted: logout.deleted, since: new Date().toISOString() } },
+      },
+    });
+    logout.recorded = true;
+  }
+
+  /** The logout could not reach WhatsApp: keep the session, mark it pending, and reconnect to deliver it. */
+  private async markLogoutPending() {
+    if (!this.logout || this.logout.marked) return;
+    this.logout.marked = true;
+    await this.writeMarker();
+    // Still pending in this process if it fails; logoutInstance tries again and tells the caller.
+    await this.recordPending().catch((error) =>
+      this.logger.error({ message: 'Could not record the pending logout on the row', error: errorFields(error) }),
+    );
+    this.logout.settle('pending');
+    if (!this.reconnectTimer && !this.connecting && this.stateConnection.state === 'close') this.scheduleReconnect();
+  }
+
+  /** A connection.update while a logout is under way: deliver it on open, finish on loggedOut, else reconnect. */
+  private async logoutUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>, from?: WASocket) {
+    if (from && from !== this.client) return;
+    const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+    if (connection) this.stateConnection = { state: connection, statusReason: statusCode ?? 200 };
+
+    // A QR: WhatsApp does not know this device, so there is nothing left to remove.
+    if (qr) return this.finishLogout();
+
+    if (connection === 'open') {
+      this.reconnectAttempts = 0;
+      try {
+        await this.removeFromWhatsApp();
+      } catch (error) {
+        // The socket dropped before the logout went out: its close reconnects.
+        this.logger.warn(`Pending logout not sent (${error?.message}), trying again on the next connection`);
+      }
+      return;
+    }
+
+    if (connection === 'close') {
+      // loggedOut: WhatsApp confirmed the removal (removeFromWhatsApp then ends the socket so), or
+      // refused the device on connecting (it is already removed). The other final codes leave
+      // nothing to log out either.
+      if ([DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406].includes(statusCode)) {
+        return this.finishLogout();
+      }
+      if (!this.logout.marked) return this.markLogoutPending();
+      this.scheduleReconnect(statusCode);
+    }
+  }
+
+  /**
+   * Ask WhatsApp to remove this device (remove-companion-device) and wait for its answer. Baileys'
+   * logout() writes the same request but waits for nothing and then ends the socket itself with
+   * loggedOut, a close that says nothing about whether WhatsApp got it. Here the socket ends with
+   * loggedOut only once WhatsApp answered; otherwise (no answer in time, an error answer, the
+   * connection failing) it ends with a code that reconnects, and the next connection says: WhatsApp
+   * refusing the device (401) finishes the logout, an open asks again. Throws when the request could
+   * not be written at all.
+   */
+  private async removeFromWhatsApp() {
+    const client = this.client;
+    const jid = this.instance.authState?.state?.creds?.me?.id ?? client.user?.id;
+    let confirmed = false;
+    try {
+      const answer: any = await client.query(
+        {
+          tag: 'iq',
+          attrs: { to: S_WHATSAPP_NET, type: 'set', xmlns: 'md' },
+          content: [{ tag: 'remove-companion-device', attrs: { jid, reason: 'user_initiated' } }],
+        },
+        BaileysStartupService.REMOVE_ANSWER_TIMEOUT_MS,
+      );
+      confirmed = answer?.attrs?.type === 'result';
+    } catch (error) {
+      this.logger.warn(`WhatsApp did not confirm the logout (${errorName(error)}): checking on the next connection`);
+    }
+    if (client !== this.client) return;
+    if (confirmed) {
+      client.end(new Boom('Intentional Logout', { statusCode: DisconnectReason.loggedOut }));
+    } else {
+      client.end(new Boom('Logout not confirmed', { statusCode: DisconnectReason.connectionClosed }));
+    }
+  }
+
+  /** WhatsApp has been told (or has nothing to remove): wipe the session and the marker, then close as a logout does. */
+  private async finishLogout() {
+    const logout = this.logout;
+    if (!logout) return;
+    this.stopReconnecting();
+    try {
+      await this.removeSession();
+      // Not pending any more: the boot must never resume a logout on a device linked again later.
+      if (!logout.deleted) {
+        await this.prismaRepository.instance.updateMany({
+          where: { id: this.instanceId },
+          data: { disconnectionObject: Prisma.DbNull },
+        });
+      }
+      if (logout.deleted) {
+        // Out of the API already: remove what was kept for the logout, the row last (it cascades to
+        // the rest). Before the marker goes, so a failure here is finished again on the next try.
+        await this.prismaRepository.proxy.deleteMany({ where: { instanceId: this.instanceId } });
+        await this.prismaRepository.instance.deleteMany({ where: { id: this.instanceId } });
+      }
+    } catch (error) {
+      // The device is off WhatsApp; the next connection answers loggedOut, which finishes it again.
+      this.logger.error({ message: 'Could not wipe the session after the logout', error: error?.toString() });
+      if (!logout.marked) await this.markLogoutPending();
+      else this.scheduleReconnect();
+      return;
+    }
+    rmSync(join(INSTANCE_DIR, this.instanceId), { recursive: true, force: true });
+    this.logout = null;
+
+    if (logout.deleted) {
+      // Announce nothing.
+      this.shutdown();
+      this.stateConnection = { state: 'close', statusReason: DisconnectReason.loggedOut };
+      this.eventEmitter.emit('logout.finished', this);
+    } else {
+      // The same close, webhooks and cleanup as a logout that reached WhatsApp at once.
+      await this.connectionUpdate({
+        connection: 'close',
+        lastDisconnect: {
+          error: new Boom('Intentional Logout', { statusCode: DisconnectReason.loggedOut }),
+          date: new Date(),
+        },
+      });
+    }
+    logout.settle('done');
+  }
+
+  // While a logout is under way, and once the instance is shut down (removed), it forwards nothing:
+  // work that finishes late (a queued batch, a picture lookup, an open's handler) included. The
+  // one exception is the removal's own announcement, which the monitor sends after the shutdown.
+  public async sendDataWebhook<T extends object = any>(
+    event: Events,
+    data: T,
+    local = true,
+    integration?: string[],
+    extra?: Record<string, any>,
+  ) {
+    if (this.logout || (this.shutDown && event !== Events.REMOVE_INSTANCE)) return;
+    this.liveRecorder?.webhook(event, data, extra);
+    return super.sendDataWebhook(event, data, local, integration, extra);
+  }
+
+  private async removeSession() {
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
     const provider = this.configService.get<ProviderSession>('PROVIDER');
@@ -331,7 +844,10 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>, from?: WASocket) {
+    // A replaced socket speaks for nobody: its close must not reconnect, its QR must not show.
+    if (from && from !== this.client) return;
+
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -373,8 +889,16 @@ export class BaileysStartupService extends ChannelStartupService {
       };
 
       if (this.phoneNumber) {
-        await delay(1000);
-        this.instance.qrcode.pairingCode = await this.client.requestPairingCode(this.phoneNumber);
+        if (this.pairingCodeSocket !== this.client) {
+          const socket = (this.pairingCodeSocket = this.client);
+          try {
+            await delay(1000);
+            this.instance.qrcode.pairingCode = await socket.requestPairingCode(this.phoneNumber);
+          } catch (error) {
+            if (this.pairingCodeSocket === socket) this.pairingCodeSocket = undefined;
+            throw error;
+          }
+        }
       } else {
         this.instance.qrcode.pairingCode = null;
       }
@@ -428,8 +952,10 @@ export class BaileysStartupService extends ChannelStartupService {
       const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
       const shouldReconnect = !codesToNotReconnect.includes(statusCode);
       if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+        // Baileys' own reconnect (QR refs ended, a dropped socket) is the same attempt: the QR budget carries over.
+        this.scheduleReconnect(statusCode);
       } else {
+        this.stopReconnecting();
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
@@ -458,13 +984,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
         this.eventEmitter.emit('logout.instance', this.instance.name, 'inner');
         this.client?.ws?.close();
-        this.client.end(new Error('Close connection'));
+        this.client?.end(new Error('Close connection'));
 
         this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
       }
     }
 
     if (connection === 'open') {
+      this.reconnectAttempts = 0;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -529,6 +1056,12 @@ export class BaileysStartupService extends ChannelStartupService {
         AND "key"->>'id' = ${key.id}
       `) as proto.IWebMessageInfo[];
 
+      // Not stored: answer undefined. Baileys calls this to answer a retry request
+      // and relays any truthy answer; only a falsy one means "not available".
+      if (!webMessageInfo?.length) {
+        return undefined;
+      }
+
       if (full) {
         return webMessageInfo[0];
       }
@@ -549,7 +1082,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return webMessageInfo[0].message;
     } catch {
-      return { conversation: '' };
+      // A failed lookup is a miss too: any truthy answer here is relayed as the message.
+      this.logger.warn('getMessage: the message lookup failed, answering nothing');
+      return undefined;
     }
   }
 
@@ -574,7 +1109,10 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async createClient(number?: string): Promise<WASocket> {
-    this.instance.authState = await this.defineAuthState();
+    this.stillWanted();
+    const authState = await this.defineAuthState();
+    this.stillWanted();
+    this.instance.authState = authState;
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
 
@@ -591,7 +1129,53 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.info(`Browser: ${browser}`);
     }
 
-    const baileysVersion = await fetchLatestWaWebVersion({});
+    let options;
+
+    if (this.localProxy?.enabled) {
+      this.logger.info('Proxy enabled: ' + this.localProxy?.host);
+
+      let proxy: Parameters<typeof makeProxyAgent>[0];
+
+      if (this.localProxy?.host?.includes('proxyscrape')) {
+        // No list, no exit: the connect fails (and is retried) rather than leave from the server's address.
+        let proxyUrls: string[];
+        try {
+          const response = await axios.get(this.localProxy?.host);
+          proxyUrls = String(response.data ?? '')
+            .split('\r\n')
+            .filter((line) => line.trim());
+        } catch (error) {
+          throw new Error(
+            `The proxy list could not be fetched (${errorName(error)}): not connecting without the proxy`,
+          );
+        }
+        if (!proxyUrls.length) throw new Error('The proxy list is empty: not connecting without the proxy');
+        proxy = 'http://' + proxyUrls[Math.floor(Math.random() * proxyUrls.length)];
+      } else {
+        proxy = {
+          host: this.localProxy.host,
+          port: this.localProxy.port,
+          protocol: this.localProxy.protocol,
+          username: this.localProxy.username,
+          password: this.localProxy.password,
+        };
+      }
+
+      if (proxy) {
+        // Baileys uploads with http.request under Node, which takes an http agent
+        // (fetchAgent), not an undici dispatcher. Downloads use fetch, which takes
+        // only a dispatcher: see mediaDownloadOptions. All three share one exit.
+        options = { agent: makeProxyAgent(proxy), fetchAgent: makeProxyAgent(proxy) };
+        this.mediaProxy = { key: this.proxyKey(), dispatcher: makeProxyAgentUndici(proxy) };
+      }
+    }
+
+    // The version request precedes every connect, so it leaves through the same exit as the socket.
+    const baileysVersion = await fetchLatestWaWebVersion(
+      options ? { httpsAgent: options.fetchAgent, proxy: false } : {},
+      options ? ({ dispatcher: this.mediaProxy.dispatcher } as RequestInit) : {},
+    );
+    this.stillWanted();
     const version = baileysVersion.version;
     const log = `Baileys version: ${version.join('.')}`;
 
@@ -599,50 +1183,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.logger.info(`Group Ignore: ${this.localSettings.groupsIgnore}`);
 
-    let options;
-
-    if (this.localProxy?.enabled) {
-      this.logger.info('Proxy enabled: ' + this.localProxy?.host);
-
-      if (this.localProxy?.host?.includes('proxyscrape')) {
-        try {
-          const response = await axios.get(this.localProxy?.host);
-          const text = response.data;
-          const proxyUrls = text.split('\r\n');
-          const rand = Math.floor(Math.random() * Math.floor(proxyUrls.length));
-          const proxyUrl = 'http://' + proxyUrls[rand];
-          options = { agent: makeProxyAgent(proxyUrl), fetchAgent: makeProxyAgentUndici(proxyUrl) };
-        } catch {
-          this.localProxy.enabled = false;
-        }
-      } else {
-        options = {
-          agent: makeProxyAgent({
-            host: this.localProxy.host,
-            port: this.localProxy.port,
-            protocol: this.localProxy.protocol,
-            username: this.localProxy.username,
-            password: this.localProxy.password,
-          }),
-          fetchAgent: makeProxyAgentUndici({
-            host: this.localProxy.host,
-            port: this.localProxy.port,
-            protocol: this.localProxy.protocol,
-            username: this.localProxy.username,
-            password: this.localProxy.password,
-          }),
-        };
-      }
-    }
-
     const socketConfig: UserFacingSocketConfig = {
       ...options,
       version,
-      logger: P({ level: this.logBaileys }),
+      logger: makeBaileysLogger(this.logBaileys),
       printQRInTerminal: false,
       auth: {
         creds: this.instance.authState.state.creds,
-        keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, P({ level: 'error' }) as any),
+        keys: makeCacheableSignalKeyStore(this.instance.authState.state.keys, makeBaileysLogger('error') as any),
       },
       msgRetryCounterCache: this.msgRetryCounterCache,
       generateHighQualityLinkPreview: true,
@@ -695,37 +1243,109 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    this.stillWanted();
+    this.retireClient();
     this.client = makeWASocket(socketConfig);
+    // Any reconnect still waiting was for the socket just replaced.
+    this.stopReconnecting();
+
+    this.liveRecorder ??= LiveRecorder.start(this.instance.name);
+    const creds = this.instance.authState.state.creds;
+    this.liveRecorder?.attach(this.client, {
+      waWebVersion: version.join('.'),
+      // creds.account is set once a pairing succeeded.
+      linkMethod: creds?.account ? 'existing-session' : this.phoneNumber ? 'code' : 'qr',
+      proxyProtocol: options ? (this.localProxy?.protocol ?? 'http') : null,
+      creds: () => this.instance.authState?.state?.creds,
+    });
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
     }
 
-    this.eventHandler();
+    const client = this.client;
+    const stopProcessing = this.eventHandler();
 
-    this.client.ws.on('CB:call', (packet) => {
-      console.log('CB:call', packet);
+    const onCall = (packet) => {
+      this.logger.verbose(`CB:call id=${packet?.attrs?.id ?? ''}`);
       const payload = { event: 'CB:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    });
-
-    this.client.ws.on('CB:ack,class:call', (packet) => {
-      console.log('CB:ack,class:call', packet);
+    };
+    const onCallAck = (packet) => {
+      this.logger.verbose(`CB:ack,class:call id=${packet?.attrs?.id ?? ''}`);
       const payload = { event: 'CB:ack,class:call', packet: packet };
       this.sendDataWebhook(Events.CALL, payload, true, ['websocket']);
-    });
+    };
+    client.ws.on('CB:call', onCall);
+    client.ws.on('CB:ack,class:call', onCallAck);
+
+    this.detachClient = () => {
+      stopProcessing();
+      client.ws.off('CB:call', onCall);
+      client.ws.off('CB:ack,class:call', onCallAck);
+    };
 
     this.phoneNumber = number;
 
     return this.client;
   }
 
+  /**
+   * Let go of the current socket before another is built: stop listening to it first, because
+   * ending a live Baileys socket announces a close, which would otherwise reconnect and end the
+   * new one in turn.
+   */
+  private retireClient() {
+    const previous = this.client;
+    this.detachClient?.();
+    this.detachClient = undefined;
+    if (!previous) return;
+    try {
+      previous.end(new Error('Replaced by a new connection'));
+    } catch (error) {
+      this.logger.warn({ message: 'Could not end the replaced socket', error: error?.toString() });
+    }
+  }
+
+  /** A new connect attempt: a fresh QR budget, and no QR or pairing code left from an earlier attempt. */
   public async connectToWhatsapp(number?: string): Promise<WASocket> {
+    if (this.logout) throw new BadRequestException('A logout is pending: the instance connects only to deliver it');
+    this.instance.qrcode = { count: 0 };
+    return await this.connect(number);
+  }
+
+  /**
+   * One connect at a time, for connectToWhatsapp and the reconnect alike. A connect that arrives
+   * while one is under way (/instance/connect polled during a reconnect) joins it; one for a
+   * different number runs after it. The socket it builds takes the place of a reconnect still
+   * waiting on its backoff (createClient drops that); if it fails before building one, the waiting
+   * reconnect still happens.
+   */
+  private async connect(number?: string): Promise<WASocket> {
+    this.stillWanted();
+    const inFlight = this.connecting;
+    if (inFlight && inFlight.number === (number ?? null)) return inFlight.socket;
+
+    const socket = (inFlight ? inFlight.socket.catch(() => undefined) : Promise.resolve()).then(() =>
+      this.openConnection(number),
+    );
+    const entry = { number: number ?? null, socket };
+    this.connecting = entry;
+    try {
+      return await socket;
+    } finally {
+      if (this.connecting === entry) this.connecting = null;
+    }
+  }
+
+  private async openConnection(number?: string): Promise<WASocket> {
     try {
       this.loadChatwoot();
-      this.loadSettings();
+      // The socket takes syncFullHistory, groupsIgnore, readStatus and alwaysOnline as config: read them first.
+      await this.loadSettings();
       this.loadWebhook();
-      this.loadProxy();
+      // The socket, the version fetch and media all take their exit from localProxy: read it before connecting.
+      await this.loadProxy();
 
       // Remontar o messageProcessor para garantir que está funcionando após reconexão
       this.messageProcessor.mount({
@@ -734,16 +1354,91 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return await this.createClient(number);
     } catch (error) {
-      this.logger.error(error);
-      throw new InternalServerErrorException(error?.toString());
+      // Shut down while it was being built: nothing failed, nothing to retry.
+      if (error instanceof ConnectAborted) throw error;
+      this.logger.error({ message: 'Connect failed', error: errorFields(error) });
+      // The same 500, still carrying what failed (not enumerable, so not in an HTTP answer): a reconnect logs it.
+      try {
+        new InternalServerErrorException(error?.toString());
+      } catch (serverError) {
+        throw Object.defineProperty(serverError, 'cause', { value: error, enumerable: false });
+      }
     }
   }
 
+  private scheduleReconnect(statusCode?: number) {
+    this.stopReconnecting();
+    if (this.shutDown) return;
+    const delay = Math.min(
+      BaileysStartupService.RECONNECT_FIRST_DELAY_MS * 2 ** Math.min(this.reconnectAttempts, 16),
+      BaileysStartupService.RECONNECT_MAX_DELAY_MS,
+    );
+    this.reconnectAttempts++;
+    this.logger.info(`Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}, status code ${statusCode})`);
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      try {
+        await this.connect(this.phoneNumber);
+      } catch (error) {
+        // No socket was built, so no close will come to retry it: schedule the next attempt here.
+        this.logger.error({ message: 'Reconnect attempt failed', error: errorFields(error?.cause ?? error) });
+        this.scheduleReconnect(statusCode);
+      }
+    }, delay);
+  }
+
+  private credsRetry: NodeJS.Timeout | null = null;
+  private credsRetryAttempts = 0;
+
+  /**
+   * Save the creds a creds.update changed. A failed save is tried again (1s, 2s, 4s... up to 30s)
+   * with the creds as they are by then, until one lands: the creds live in memory meanwhile, and a
+   * restart before it would open the old ones.
+   */
+  private saveCreds() {
+    const authState = this.instance.authState;
+    if (!authState?.saveCreds) return;
+    Promise.resolve()
+      .then(() => authState.saveCreds())
+      .then(() => {
+        this.credsRetryAttempts = 0;
+      })
+      .catch((error) => {
+        this.logger.error({ message: 'Could not save the creds, trying again', error: errorFields(error) });
+        if (this.credsRetry || this.shutDown || authState !== this.instance.authState) return;
+        const delay = Math.min(1_000 * 2 ** this.credsRetryAttempts++, 30_000);
+        this.credsRetry = setTimeout(() => {
+          this.credsRetry = null;
+          this.saveCreds();
+        }, delay);
+      });
+  }
+
+  /** A connect failed before it built a socket (so no close will retry it): try again after the backoff. */
+  public retryConnect() {
+    if (!this.reconnectTimer && !this.connecting) this.scheduleReconnect();
+  }
+
+  /** Drop a reconnect that is still waiting: the instance is being logged out or deleted. */
+  public stopReconnecting() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  /**
+   * A new socket after a profile or privacy change, through the same one-at-a-time connect as any
+   * other: it joins a connect under way. Nothing for an instance shut down, or one whose pending
+   * logout owns the connection.
+   */
   public async reloadConnection(): Promise<WASocket> {
+    if (this.shutDown || this.logout) return this.client;
     try {
-      return await this.createClient(this.phoneNumber);
+      return await this.connect(this.phoneNumber);
     } catch (error) {
-      this.logger.error(error);
+      if (error instanceof ConnectAborted) return this.client;
+      this.logger.error({ message: 'Reload connection failed', error: errorFields(error?.cause ?? error) });
       throw new InternalServerErrorException(error?.toString());
     }
   }
@@ -766,7 +1461,11 @@ export class BaileysStartupService extends ChannelStartupService {
           unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
         }));
 
-      this.sendDataWebhook(Events.CHATS_UPSERT, chatsToInsert);
+      const stateOf = new Map(chats.map((chat) => [chat.id, chatState(chat)]));
+      this.sendDataWebhook(
+        Events.CHATS_UPSERT,
+        chatsToInsert.map((chat) => ({ ...chat, ...stateOf.get(chat.remoteJid) })),
+      );
 
       if (chatsToInsert.length > 0) {
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.CHATS)
@@ -782,7 +1481,7 @@ export class BaileysStartupService extends ChannelStartupService {
       >[],
     ) => {
       const chatsRaw = chats.map((chat) => {
-        return { remoteJid: chat.id, instanceId: this.instanceId };
+        return { remoteJid: chat.id, instanceId: this.instanceId, ...chatState(chat) };
       });
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
@@ -806,7 +1505,12 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private readonly contactHandle = {
-    'contacts.upsert': async (contacts: Contact[]) => {
+    // `saved` on each contacts.upsert item says the name is certainly the one the
+    // owner saved in their address book. In Baileys only an app-state contact
+    // action emits contacts.upsert, with name = fullName || firstName || username,
+    // so a name equal to the username is a handle, not a saved name. Callers that
+    // cannot be sure (history) pass saved: false.
+    'contacts.upsert': async (contacts: (Contact & { saved?: boolean })[]) => {
       try {
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
@@ -816,7 +1520,13 @@ export class BaileysStartupService extends ChannelStartupService {
         }));
 
         if (contactsRaw.length > 0) {
-          this.sendDataWebhook(Events.CONTACTS_UPSERT, contactsRaw);
+          this.sendDataWebhook(
+            Events.CONTACTS_UPSERT,
+            contactsRaw.map((raw, i) => ({
+              ...raw,
+              saved: contacts[i].saved ?? (!!contacts[i].name && contacts[i].name !== contacts[i].username),
+            })),
+          );
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
             await this.prismaRepository.contact.createMany({ data: contactsRaw, skipDuplicates: true });
@@ -843,51 +1553,8 @@ export class BaileysStartupService extends ChannelStartupService {
           );
         }
 
-        const updatedContacts = await Promise.all(
-          contacts.map(async (contact) => ({
-            remoteJid: contact.id,
-            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
-            profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
-            instanceId: this.instanceId,
-          })),
-        );
-
-        if (updatedContacts.length > 0) {
-          const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
-          if (usersContacts) {
-            await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
-          }
-
-          this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
-          await Promise.all(
-            updatedContacts.map(async (contact) => {
-              if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-                await this.prismaRepository.contact.updateMany({
-                  where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
-                  data: { profilePicUrl: contact.profilePicUrl },
-                });
-              }
-
-              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-                const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
-
-                const findParticipant = await this.chatwootService.findContact(
-                  instance,
-                  contact.remoteJid.split('@')[0],
-                );
-
-                if (!findParticipant) {
-                  return;
-                }
-
-                this.chatwootService.updateContact(instance, findParticipant.id, {
-                  name: contact.pushName,
-                  avatar_url: contact.profilePicUrl,
-                });
-              }
-            }),
-          );
-        }
+        // Pictures follow on contacts.update when their lookups finish: history waits for none of them.
+        void this.contactPictures(contacts);
       } catch (error) {
         console.error(error);
         this.logger.error(`Error: ${error.message}`);
@@ -898,10 +1565,17 @@ export class BaileysStartupService extends ChannelStartupService {
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
       for await (const contact of contacts) {
         this.logger.debug(`Updating contact: ${JSON.stringify(contact, null, 2)}`);
+        // imgUrl is set only by WhatsApp's picture notification: 'changed' or 'removed'.
+        if (contact.imgUrl === 'changed' || contact.imgUrl === 'removed') this.invalidatePicture(createJid(contact.id));
+        const renamed = contact?.name ?? contact?.verifiedName;
+        const awaiting = this.namesAwaitingPicture.get(contact.id);
+        if (renamed && awaiting) awaiting.name = renamed;
+        if (contact.imgUrl === 'removed') this.pictureCache.set(createJid(contact.id), { url: null, at: Date.now() });
         contactsRaw.push({
           remoteJid: contact.id,
           pushName: contact?.name ?? contact?.verifiedName,
-          profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
+          profilePicUrl: (await this.cachedProfilePicture(contact.id, { fresh: contact.imgUrl === 'changed' }))
+            .profilePictureUrl,
           instanceId: this.instanceId,
         });
       }
@@ -923,6 +1597,57 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  /**
+   * Tell consumers which phone number a private @lid belongs to: one CONTACTS_UPSERT
+   * item per pair, { remoteJid: <phone>, pushName: null, lid, phoneNumber: <phone> }.
+   */
+  private lidMappingHandle(mappings: { lid?: string; pn?: string }[]) {
+    const seen = new Set<string>();
+    const contacts = [];
+    for (const m of mappings ?? []) {
+      let [lid, pn] = [m?.lid, m?.pn];
+      if (isLidUser(pn) && isPnUser(lid)) [lid, pn] = [pn, lid];
+      if (!isLidUser(lid) || !isPnUser(pn)) continue;
+      [lid, pn] = [jidNormalizedUser(lid), jidNormalizedUser(pn)];
+      if (!lid || !pn || seen.has(`${lid}|${pn}`)) continue;
+      seen.add(`${lid}|${pn}`);
+      contacts.push({ remoteJid: pn, pushName: null, lid, phoneNumber: pn, instanceId: this.instanceId });
+    }
+    if (contacts.length) {
+      this.sendDataWebhook(Events.CONTACTS_UPSERT, contacts);
+    }
+  }
+
+  /**
+   * Baileys hands over the mappings it learns from a history sync as `lidPnMappings`
+   * on messaging-history.set, but history is processed inside a buffered function and
+   * the event buffer drops that field when it consolidates the batch (Baileys
+   * lib/Utils/event-buffer.js, consolidateEvents). So read it where Baileys emits it,
+   * before the buffer does. Every mapping in the batch is there, whether it came from
+   * phoneNumberToLidMappings or from a conversation's pnJid or lidJid, and nothing is
+   * looked up, so no network query can follow.
+   */
+  private tapHistoryLidMappings() {
+    const client = this.client;
+    const ev = client.ev as any;
+    if (ev.__lidPnMappingsTap) return;
+    const emit = ev.emit.bind(ev);
+    ev.emit = (event: string, data: any) => {
+      if (event === 'messaging-history.set' && data?.lidPnMappings?.length) {
+        const mappings = [...data.lidPnMappings];
+        this.eventProcessingQueue = this.eventProcessingQueue.then(() => {
+          try {
+            if (!this.endSession && !this.logout && client === this.client) this.lidMappingHandle(mappings);
+          } catch (error) {
+            this.logger.error(error);
+          }
+        });
+      }
+      return emit(event, data);
+    };
+    ev.__lidPnMappingsTap = true;
+  }
+
   private readonly messageHandle = {
     'messaging-history.set': async ({
       messages,
@@ -941,7 +1666,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          console.log('received on-demand history sync, messages=', messages);
+          this.logger.info(`received on-demand history sync, messages=${messages.length}`);
         }
         console.log(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
@@ -975,6 +1700,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         const chatsRaw: { remoteJid: string; instanceId: string; name?: string }[] = [];
+        const chatItems: Record<string, any>[] = [];
         const chatsRepository = new Set(
           (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
             (chat) => chat.remoteJid,
@@ -987,9 +1713,10 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           chatsRaw.push({ remoteJid: chat.id, instanceId: this.instanceId, name: chat.name });
+          chatItems.push({ ...chatsRaw[chatsRaw.length - 1], ...chatState(chat) });
         }
 
-        this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
+        this.sendDataWebhook(Events.CHATS_SET, chatItems);
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
           await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
@@ -1068,7 +1795,10 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         await this.contactHandle['contacts.upsert'](
-          contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+          contacts
+            .filter((c) => !!c.notify || !!c.name)
+            // A history name is displayName || name || username, and a push name is the profile name.
+            .map((c) => ({ id: c.id, name: c.name ?? c.notify, saved: false })),
         );
 
         contacts = undefined;
@@ -1085,21 +1815,20 @@ export class BaileysStartupService extends ChannelStartupService {
     ) => {
       try {
         for (const received of messages) {
-          if (
-            received?.messageStubParameters?.some?.((param) =>
-              [
-                'No matching sessions found for message',
-                'Bad MAC',
-                'failed to decrypt message',
-                'SessionError',
-                'Invalid PreKey ID',
-                'No session record',
-                'No session found to decrypt message',
-                'Message absent from node',
-              ].some((err) => param?.includes?.(err)),
-            )
-          ) {
-            this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
+          const decryptFailure = [
+            'No matching sessions found for message',
+            'Bad MAC',
+            'failed to decrypt message',
+            'SessionError',
+            'Invalid PreKey ID',
+            'No session record',
+            'No session found to decrypt message',
+            'Message absent from node',
+          ].find((err) => received?.messageStubParameters?.some?.((param) => param?.includes?.(err)));
+          if (decryptFailure) {
+            this.logger.warn(
+              `Message ignored with messageStubParameters: id=${received.key?.id}, chat=${jidKind(received.key?.remoteJid)}, reason=${decryptFailure}`,
+            );
             continue;
           }
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
@@ -1110,7 +1839,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
               console.log('requested placeholder resync, id=', messageId);
             } else if (requestId) {
-              console.log('Message received from phone, id=', requestId, received);
+              this.logger.info(`Message received from phone, id=${requestId}, message id=${received.key?.id}`);
             }
 
             if (text == 'onDemandHistSync') {
@@ -1196,7 +1925,9 @@ export class BaileysStartupService extends ChannelStartupService {
                   data: { name: received.pushName },
                 });
               } catch {
-                console.log(`Chat insert record ignored: ${received.key.remoteJid} - ${this.instanceId}`);
+                this.logger.warn(
+                  `Chat insert record ignored: ${jidKind(received.key.remoteJid)} chat - ${this.instanceId}`,
+                );
               }
             }
           }
@@ -1447,8 +2178,8 @@ export class BaileysStartupService extends ChannelStartupService {
                 const buffer = await downloadMediaMessage(
                   { key: received.key, message: received?.message },
                   'buffer',
-                  {},
-                  { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                  this.mediaDownloadOptions(),
+                  { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
                 );
 
                 if (buffer) {
@@ -1458,8 +2189,8 @@ export class BaileysStartupService extends ChannelStartupService {
                   const buffer = await downloadMediaMessage(
                     { key: received.key, message: received?.message },
                     'buffer',
-                    {},
-                    { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                    this.mediaDownloadOptions(),
+                    { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
                   );
 
                   if (buffer) {
@@ -1467,7 +2198,13 @@ export class BaileysStartupService extends ChannelStartupService {
                   }
                 }
               } catch (error) {
-                this.logger.error(['Error converting media to base64', error?.message]);
+                // A failed download's error names the signed media link: bounded, scrubbed fields only.
+                this.logger.error({
+                  message: 'Error converting media to base64',
+                  messageId: received.key?.id,
+                  chatType: jidKind(received.key?.remoteJid),
+                  error: errorFields(error),
+                });
               }
             }
           }
@@ -1475,11 +2212,15 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(messageRaw);
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
+          // The webhook shows the phone JID as remoteJid, and keeps the @lid WhatsApp stores
+          // the message under in remoteJidAlt (upstream develop's swap), so a consumer can
+          // still name the message the way the phone does (a media re-upload request).
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
+            const lid = messageRaw.key.remoteJid;
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+            messageRaw.key.remoteJidAlt = lid;
+            messageRaw.key.addressingMode = 'pn';
           }
-          console.log(messageRaw);
-
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
           await chatbotController.emit({
@@ -1501,7 +2242,7 @@ export class BaileysStartupService extends ChannelStartupService {
           } = {
             remoteJid: received.key.remoteJid,
             pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
+            profilePicUrl: (await this.cachedProfilePicture(received.key.remoteJid)).profilePictureUrl,
             instanceId: this.instanceId,
           };
 
@@ -1541,7 +2282,8 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
-          this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
+          // A message's pushName is the sender's own profile name, never a saved one.
+          this.sendDataWebhook(Events.CONTACTS_UPSERT, { ...contactRaw, saved: false });
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
             await this.prismaRepository.contact.upsert({
@@ -1570,7 +2312,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const cached = await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
-        console.log('CACHE:', { cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
+        this.logger.verbose({ cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
 
         if (
           (update.messageTimestamp && update.messageTimestamp === cached) ||
@@ -1646,7 +2388,7 @@ export class BaileysStartupService extends ChannelStartupService {
             findMessage = messages[0] || null;
 
             if (!findMessage?.id) {
-              this.logger.warn(`Original message not found for update. Skipping. Key: ${JSON.stringify(key)}`);
+              this.logger.warn(`Original message not found for update. Skipping. Message id: ${key.id}`);
               continue;
             }
             message.messageId = findMessage.id;
@@ -1719,7 +2461,9 @@ export class BaileysStartupService extends ChannelStartupService {
               try {
                 await this.prismaRepository.chat.update({ where: { id: existingChat.id }, data: chatToInsert });
               } catch {
-                console.log(`Chat insert record ignored: ${chatToInsert.remoteJid} - ${chatToInsert.instanceId}`);
+                this.logger.warn(
+                  `Chat insert record ignored: ${jidKind(chatToInsert.remoteJid)} chat - ${chatToInsert.instanceId}`,
+                );
               }
             }
           }
@@ -1739,27 +2483,31 @@ export class BaileysStartupService extends ChannelStartupService {
       this.sendDataWebhook(Events.GROUPS_UPDATE, groupMetadataUpdate);
 
       groupMetadataUpdate.forEach((group) => {
-        if (isJidGroup(group.id)) {
-          this.updateGroupMetadataCache(group.id);
+        if (!isJidGroup(group.id)) return;
+        // A listing (groupFetchAllParticipating) carries each group's full metadata: keep it as it is.
+        // A change (subject, settings) carries only what changed: ask for the group once.
+        if (Array.isArray(group.participants)) {
+          this.keepGroupMetadata(group.id, group as GroupMetadata);
+        } else {
+          this.refreshGroupMetadata(group.id);
         }
       });
     },
 
     'group-participants.update': async (participantsUpdate: {
       id: string;
-      participants: string[];
+      participants: (GroupParticipant | string)[];
       action: ParticipantAction;
     }) => {
       // ENHANCEMENT: Adds participantsData field while maintaining backward compatibility
-      // MAINTAINS: participants: string[] (original JID strings)
-      // ADDS: participantsData: { jid: string, phoneNumber: string, name?: string, imgUrl?: string }[]
+      // MAINTAINS: participants, exactly as Baileys emitted it
+      // ADDS: participantsData: { jid: string, phoneNumber?: string, name?: string, imgUrl?: string }[]
       // This enables LID to phoneNumber conversion without breaking existing webhook consumers
-
-      // Helper to normalize participantId as phone number
-      const normalizePhoneNumber = (id: string | null | undefined): string => {
-        // Remove @lid, @s.whatsapp.net suffixes and extract just the number part
-        return String(id || '').split('@')[0];
-      };
+      //
+      // Baileys 7 emits each participant as a GroupParticipant object ({ id, phoneNumber?, ... });
+      // Baileys 6 emitted jid strings. phoneNumber is a phone jid (<number>@s.whatsapp.net): the
+      // participant's own, else the group metadata's, else the LID mapping store's, else none.
+      const phoneJid = (jid: string | null | undefined) => (isPnUser(jid) ? jidNormalizedUser(jid) : undefined);
 
       try {
         // Usa o mesmo método que o endpoint /group/participants
@@ -1771,28 +2519,34 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         // Filtra apenas os participantes que estão no evento
-        const resolvedParticipants = participantsUpdate.participants.map((participantId) => {
-          const participantData = groupParticipants.participants.find((p) => p.id === participantId);
+        const resolvedParticipants = await Promise.all(
+          participantsUpdate.participants.map(async (participant) => {
+            const jid = typeof participant === 'string' ? participant : participant?.id;
+            const participantData = groupParticipants.participants.find((p) => p.id === jid);
 
-          let phoneNumber: string;
-          if (participantData?.phoneNumber) {
-            phoneNumber = participantData.phoneNumber;
-          } else {
-            phoneNumber = normalizePhoneNumber(participantId);
-          }
+            let phoneNumber =
+              phoneJid(typeof participant === 'string' ? undefined : participant?.phoneNumber) ??
+              phoneJid(participantData?.phoneNumber) ??
+              phoneJid(jid);
+            if (!phoneNumber && isLidUser(jid)) {
+              phoneNumber = phoneJid(
+                await this.client.signalRepository?.lidMapping?.getPNForLID(jid).catch((): undefined => undefined),
+              );
+            }
 
-          return {
-            jid: participantId,
-            phoneNumber,
-            name: participantData?.name,
-            imgUrl: participantData?.imgUrl,
-          };
-        });
+            return {
+              jid,
+              phoneNumber,
+              name: participantData?.name,
+              imgUrl: participantData?.imgUrl,
+            };
+          }),
+        );
 
         // Mantém formato original + adiciona dados resolvidos
         const enhancedParticipantsUpdate = {
           ...participantsUpdate,
-          participants: participantsUpdate.participants, // Mantém array original de strings
+          participants: participantsUpdate.participants, // Mantém o array original, como o Baileys emitiu
           // Adiciona dados resolvidos em campo separado
           participantsData: resolvedParticipants,
         };
@@ -1800,13 +2554,13 @@ export class BaileysStartupService extends ChannelStartupService {
         this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, enhancedParticipantsUpdate);
       } catch (error) {
         this.logger.error(
-          `Failed to resolve participant data for GROUP_PARTICIPANTS_UPDATE webhook: ${error.message} | Group: ${participantsUpdate.id} | Participants: ${participantsUpdate.participants.length}`,
+          `Failed to resolve participant data for GROUP_PARTICIPANTS_UPDATE webhook: ${error.message} | Participants: ${participantsUpdate.participants.length}`,
         );
         // Fallback - envia sem conversão
         this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, participantsUpdate);
       }
 
-      this.updateGroupMetadataCache(participantsUpdate.id);
+      this.refreshGroupMetadata(participantsUpdate.id);
     },
   };
 
@@ -1872,13 +2626,35 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
-  private eventHandler() {
-    this.client.ev.process(async (events) => {
+  /** Returns the function that stops processing this socket's events. */
+  private eventHandler(): () => void {
+    const client = this.client;
+    this.tapHistoryLidMappings();
+
+    return client.ev.process(async (events) => {
+      // Events a replaced socket still emits do not drive the instance.
+      if (client !== this.client) return;
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
+        // Checked again when the batch runs, which can be long after it was queued: an instance shut
+        // down meanwhile (removed) handles nothing more. A batch of a socket replaced meanwhile by a
+        // reconnect of the same session still runs: its messages were delivered and acknowledged to
+        // WhatsApp, which will not send them again.
+        if (this.shutDown) return;
         try {
+          // A logout under way: nothing is forwarded or stored; the connection only delivers the logout.
+          if (this.logout) {
+            if (events['creds.update']) this.saveCreds();
+            if (events['connection.update']) await this.logoutUpdate(events['connection.update'], client);
+            return;
+          }
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
+            // A failed read must not drop the batch (messages, creds, connection updates with it):
+            // fall back to the settings loaded at connect and kept by setSettings.
+            const settings = await this.findSettings().catch((error) => {
+              this.logger.warn(`Settings read failed, using the last known settings: ${error?.message ?? error}`);
+              return { ...this.localSettings };
+            });
 
             if (events.call) {
               const call = events.call[0];
@@ -1893,18 +2669,24 @@ export class BaileysStartupService extends ChannelStartupService {
                 }
                 const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
 
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                const upsert = () => this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+                if (this.liveRecorder) this.liveRecorder.fromApp(upsert);
+                else upsert();
               }
 
               this.sendDataWebhook(Events.CALL, call);
             }
 
             if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
+              this.connectionUpdate(events['connection.update'], client);
             }
 
             if (events['creds.update']) {
-              this.instance.authState.saveCreds();
+              this.saveCreds();
+            }
+
+            if (events['lid-mapping.update']) {
+              this.lidMappingHandle([events['lid-mapping.update']]);
             }
 
             if (events['messaging-history.set']) {
@@ -2042,16 +2824,149 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
+  // The newest name of each contact whose picture contactPictures is still looking up: a rename
+  // that arrives meanwhile (contacts.update) is what that update must carry, not the batch's name.
+  private readonly namesAwaitingPicture = new Map<string, { name: string; refs: number }>();
+
+  /**
+   * Look up the pictures of contacts from contacts.upsert (history, address book) and send them on
+   * contacts.update, with each contact's newest name (a rename that arrived while the lookups ran
+   * wins over the batch's). A contact whose picture WhatsApp said changed or was removed while its
+   * lookup ran is left out: that notification's own update is the newer one.
+   */
+  private async contactPictures(contacts: Contact[]) {
+    const names = contacts.map((contact) => {
+      const name = contact?.name || contact?.verifiedName || contact.id.split('@')[0];
+      const entry = this.namesAwaitingPicture.get(contact.id) ?? { name, refs: 0 };
+      entry.name = name;
+      entry.refs++;
+      this.namesAwaitingPicture.set(contact.id, entry);
+      return entry;
+    });
+    try {
+      const looked = await Promise.all(
+        contacts.map(async (contact) => {
+          const version = this.pictureVersion(createJid(contact.id));
+          const { profilePictureUrl } = await this.cachedProfilePicture(contact.id, { bulk: true });
+          return { contact, version, profilePictureUrl };
+        }),
+      );
+      const updatedContacts = looked
+        .filter(({ contact, version }) => this.pictureVersion(createJid(contact.id)) === version)
+        .map(({ contact, profilePictureUrl }) => ({
+          remoteJid: contact.id,
+          pushName: this.namesAwaitingPicture.get(contact.id)?.name,
+          profilePicUrl: profilePictureUrl,
+          instanceId: this.instanceId,
+        }));
+
+      if (updatedContacts.length > 0) {
+        const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
+        if (usersContacts) {
+          await saveOnWhatsappCache(usersContacts.map((c) => ({ remoteJid: c.remoteJid })));
+        }
+
+        this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
+        await Promise.all(
+          updatedContacts.map(async (contact) => {
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+              await this.prismaRepository.contact.updateMany({
+                where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
+                data: { profilePicUrl: contact.profilePicUrl },
+              });
+            }
+
+            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+              const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
+
+              const findParticipant = await this.chatwootService.findContact(instance, contact.remoteJid.split('@')[0]);
+
+              if (!findParticipant) {
+                return;
+              }
+
+              this.chatwootService.updateContact(instance, findParticipant.id, {
+                name: contact.pushName,
+                avatar_url: contact.profilePicUrl,
+              });
+            }
+          }),
+        );
+      }
+    } catch (error) {
+      this.logger.error(`Error: ${error.message}`);
+    } finally {
+      for (const [i, contact] of contacts.entries()) {
+        const entry = names[i];
+        if (--entry.refs <= 0 && this.namesAwaitingPicture.get(contact.id) === entry) {
+          this.namesAwaitingPicture.delete(contact.id);
+        }
+      }
+    }
+  }
+
+  /**
+   * Asks WhatsApp now (an explicit request), and keeps the answer for the event handlers, unless
+   * WhatsApp said the picture changed or was removed while it was asking: that is newer.
+   */
   public async profilePicture(number: string) {
     const jid = createJid(number);
+    const version = this.pictureVersion(jid);
+    let profilePictureUrl: string | null;
 
     try {
-      const profilePictureUrl = await this.client.profilePictureUrl(jid, 'image');
-
-      return { wuid: jid, profilePictureUrl };
+      profilePictureUrl = await this.client.profilePictureUrl(jid, 'image');
     } catch {
-      return { wuid: jid, profilePictureUrl: null };
+      profilePictureUrl = null;
     }
+
+    if (this.pictureVersion(jid) === version) this.pictureCache.set(jid, { url: profilePictureUrl, at: Date.now() });
+    return { wuid: jid, profilePictureUrl };
+  }
+
+  /** Bumped by WhatsApp's picture notification, so a lookup started before it cannot overwrite it. */
+  private readonly pictureVersions = new Map<string, number>();
+  private pictureVersion(jid: string) {
+    return this.pictureVersions.get(jid) ?? 0;
+  }
+  private invalidatePicture(jid: string) {
+    this.pictureVersions.set(jid, this.pictureVersion(jid) + 1);
+    this.pictureCache.delete(jid);
+    this.pictureLookups.delete(jid);
+  }
+
+  /**
+   * The picture the event handlers report: kept for PICTURE_TTL_MS, one lookup per jid at a time.
+   * Bulk lookups (history, address book) queue behind each other; a live event's lookup never joins one.
+   */
+  private async cachedProfilePicture(number: string, opts: { fresh?: boolean; bulk?: boolean } = {}) {
+    const jid = createJid(number);
+    const bulk = !!opts.bulk;
+    const kept = () => {
+      const k = this.pictureCache.get(jid);
+      return !opts.fresh && k && Date.now() - k.at < this.PICTURE_TTL_MS ? k : undefined;
+    };
+
+    if (kept()) return { wuid: jid, profilePictureUrl: kept().url };
+
+    const pending = opts.fresh ? undefined : this.pictureLookups.get(jid);
+    if (pending && (bulk || !pending.bulk)) return { wuid: jid, profilePictureUrl: await pending.lookup };
+
+    const lookup = this.backgroundQueries
+      // A queued lookup may find the picture already kept by the time its turn comes.
+      .run(
+        async () => {
+          const k = kept();
+          return k ? k.url : (await this.profilePicture(jid)).profilePictureUrl;
+        },
+        { bulk },
+      )
+      .finally(() => {
+        if (this.pictureLookups.get(jid)?.lookup === lookup) this.pictureLookups.delete(jid);
+      });
+    this.pictureLookups.set(jid, { bulk, lookup });
+
+    return { wuid: jid, profilePictureUrl: await lookup };
   }
 
   public async getStatus(number: string) {
@@ -2515,8 +3430,8 @@ export class BaileysStartupService extends ChannelStartupService {
             const buffer = await downloadMediaMessage(
               { key: messageRaw.key, message: messageRaw?.message },
               'buffer',
-              {},
-              { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+              this.mediaDownloadOptions(),
+              { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
             );
 
             if (buffer) {
@@ -2526,8 +3441,8 @@ export class BaileysStartupService extends ChannelStartupService {
               const buffer = await downloadMediaMessage(
                 { key: messageRaw.key, message: messageRaw?.message },
                 'buffer',
-                {},
-                { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                this.mediaDownloadOptions(),
+                { logger: makeBaileysLogger('error') as any, reuploadRequest: this.client.updateMediaMessage },
               );
 
               if (buffer) {
@@ -2535,7 +3450,13 @@ export class BaileysStartupService extends ChannelStartupService {
               }
             }
           } catch (error) {
-            this.logger.error(['Error converting media to base64', error?.message]);
+            // A failed download's error names the signed media link: bounded, scrubbed fields only.
+            this.logger.error({
+              message: 'Error converting media to base64',
+              messageId: messageRaw.key?.id,
+              chatType: jidKind(messageRaw.key?.remoteJid),
+              error: errorFields(error),
+            });
           }
         }
       }
@@ -3834,7 +4755,99 @@ export class BaileysStartupService extends ChannelStartupService {
     return map[mediaType] || null;
   }
 
+  private proxyKey() {
+    const { protocol, host, port, username, password } = this.localProxy;
+    return JSON.stringify([protocol, host, port, username, password]);
+  }
+
+  /**
+   * Options for Baileys' media downloads. Baileys downloads with fetch, which
+   * ignores the socket's `agent`/`fetchAgent` and routes only through a
+   * `dispatcher`, so without this the media leaves from the server's own IP
+   * while the messages leave through the instance's proxy.
+   */
+  private mediaDownloadOptions() {
+    if (!this.localProxy?.enabled || !this.localProxy.host) return {};
+    const key = this.proxyKey();
+    if (this.mediaProxy?.key !== key) {
+      // A proxyscrape host is a list the socket picked one exit from; only the socket's own dispatcher
+      // is that exit. Without one, the download fails rather than leave from the server's address.
+      if (this.localProxy.host.includes('proxyscrape')) {
+        if (this.mediaProxy) return { options: { dispatcher: this.mediaProxy.dispatcher } as RequestInit };
+        throw new BadRequestException('No proxy exit for this download yet: connect the instance first');
+      }
+      this.mediaProxy = {
+        key,
+        dispatcher: makeProxyAgentUndici({
+          host: this.localProxy.host,
+          port: this.localProxy.port,
+          protocol: this.localProxy.protocol,
+          username: this.localProxy.username,
+          password: this.localProxy.password,
+        }),
+      };
+    }
+    return { options: { dispatcher: this.mediaProxy.dispatcher } as RequestInit };
+  }
+
+  /**
+   * End Baileys' wait for the phone's answer to a re-upload request (updateMediaMessage waits on
+   * messages.media-update with no timeout): answer it with an error for that message, on the socket
+   * that asked. Marked as Evolution's own event for a live recording.
+   */
+  private abandonReupload(client: WASocket, key: WAMessageKey) {
+    const emit = () =>
+      client?.ev?.emit('messages.media-update', [
+        { key, error: new Boom('Media re-upload abandoned: no answer in time', { statusCode: 408 }) },
+      ]);
+    try {
+      if (this.liveRecorder) this.liveRecorder.fromApp(emit);
+      else emit();
+    } catch (error) {
+      this.logger.warn({ message: 'Could not end the re-upload wait', error: errorFields(error) });
+    }
+  }
+
+  /**
+   * The key the phone stores a message under, which is how a request about the message
+   * (a media re-upload) must name it: the phone refuses one that names a DM it keeps
+   * under an @lid by the phone JID. The messages.upsert webhook shows such a DM under
+   * the phone JID with the @lid in remoteJidAlt; a key from Evolution 2.3.7 has the phone
+   * twice and addressingMode 'lid', and only Baileys' LID mapping still knows the @lid.
+   * A group key names its sender the same way, in participant / participantAlt.
+   */
+  private async originalMessageKey(key: WAMessageKey): Promise<WAMessageKey> {
+    if (!key) return key;
+    const original = { ...key };
+    if (!isLidUser(key.remoteJid) && isLidUser(key.remoteJidAlt)) {
+      original.remoteJid = key.remoteJidAlt;
+      original.remoteJidAlt = key.remoteJid;
+      original.addressingMode = 'lid';
+    } else if (key.addressingMode === 'lid' && isPnUser(key.remoteJid)) {
+      let lid: string | null = null;
+      try {
+        lid = await this.client.signalRepository?.lidMapping?.getLIDForPN(key.remoteJid);
+      } catch {
+        // No mapping: the key is asked for as it was given.
+      }
+      if (isLidUser(lid)) {
+        original.remoteJid = lid;
+        original.remoteJidAlt = key.remoteJid;
+      }
+    }
+    if (!isLidUser(key.participant) && isLidUser(key.participantAlt)) {
+      original.participant = key.participantAlt;
+      original.participantAlt = key.participant;
+      original.addressingMode = 'lid';
+    }
+    return original;
+  }
+
   public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
+    // Set once a download is attempted: whether the phone was asked to re-upload an expired file.
+    let reupload: MediaReupload | undefined;
+    // Set when the re-upload failed: why (reuploadRefusal).
+    let reuploadReason: string | undefined;
     try {
       const m = data?.message;
       const convertToMp4 = data?.convertToMp4 ?? false;
@@ -3889,20 +4902,102 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
-      if (typeof mediaMessage['mediaKey'] === 'object') {
-        msg.message[mediaType].mediaKey = Uint8Array.from(Object.values(mediaMessage['mediaKey']));
+      if (mediaMessage['mediaKey'] != null) {
+        msg.message[mediaType].mediaKey = mediaKeyBytes(mediaMessage['mediaKey']);
       }
 
       let buffer: Buffer;
+      const media = `message=${msg?.key?.id}, chat=${jidKind(msg?.key?.remoteJid)}`;
+      // reupload: false downloads only what is still on WhatsApp's servers.
+      const askPhone = data?.reupload !== false;
+      reupload = 'not_requested';
+      // Asks the phone for a new copy, for a bounded time. Called at most once per download.
+      const reuploadRequest = async (message: WAMessage): Promise<WAMessage> => {
+        this.logger.warn(`media download: ${media}, outcome=reupload_requested`);
+        let timer: NodeJS.Timeout;
+        const timeout = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error(`the phone did not answer the re-upload request in ${MEDIA_REUPLOAD_TIMEOUT_MS}ms`);
+            reject(Object.assign(error, { name: 'ReuploadTimeoutError' }));
+          }, MEDIA_REUPLOAD_TIMEOUT_MS);
+        });
+        const client = this.client;
+        let abandoned = false;
+        let asking: Promise<WAMessage>;
+        try {
+          // The key's original form first; when the key cannot say which address the phone keeps the
+          // message under (the phone with its @lid beside it), the key as given if the phone refuses.
+          const ask = async () => {
+            const original = await this.originalMessageKey(message.key);
+            const candidates = [original];
+            if (JSON.stringify(original) !== JSON.stringify(message.key)) candidates.push(message.key);
+            for (const [i, key] of candidates.entries()) {
+              if (abandoned) throw new Error('re-upload abandoned');
+              try {
+                return await client.updateMediaMessage({ ...message, key });
+              } catch (error) {
+                const refused = typeof error?.data?.result === 'number';
+                if (!refused || i === candidates.length - 1) throw error;
+                this.logger.warn(
+                  `media download: ${media}, outcome=reupload_refused, reason=${reuploadRefusal(error)}, trying the other address`,
+                );
+              }
+            }
+          };
+          asking = ask();
+          const updated = await Promise.race([asking, timeout]);
+          reupload = 'ok';
+          this.logger.warn(`media download: ${media}, outcome=reupload_ok`);
+          return updated;
+        } catch (error) {
+          if (error?.name === 'ReuploadTimeoutError') {
+            // Baileys waits for the answer with no timeout of its own (bindWaitForEvent): end that
+            // wait, so its listeners go and an answer arriving later changes nothing.
+            abandoned = true;
+            asking?.catch(() => undefined);
+            this.abandonReupload(client, message.key);
+          }
+          reupload = 'failed';
+          reuploadReason = reuploadRefusal(error);
+          this.logger.warn(
+            `media download: ${media}, outcome=reupload_failed, error=${error?.name ?? 'unknown'}, status=${httpStatus(error)}, reason=${reuploadReason}`,
+          );
+          throw error;
+        } finally {
+          clearTimeout(timer);
+        }
+      };
+      const target: WAMessage = { key: msg?.key, message: msg?.message };
+      // The links as first downloaded, for a 403 whose error does not name the one that failed.
+      const link = { url: msg.message[mediaType]?.url, directPath: msg.message[mediaType]?.directPath };
+      // No reuploadRequest for Baileys: Evolution asks the phone itself, below. Baileys
+      // means to ask on a 404 or 410, but 7.0.0-rc14 checks error.status
+      // (lib/Utils/messages.js:836) while its CDN fetch sets only output.statusCode
+      // (lib/Utils/messages-media.js:304), so it never does. Handing it the request as
+      // well would let a Baileys that does ask make a second one.
+      const download = (message: WAMessage) =>
+        downloadMediaMessage(message, 'buffer', this.mediaDownloadOptions()) as Promise<Buffer>;
 
       try {
-        buffer = await downloadMediaMessage(
-          { key: msg?.key, message: msg?.message },
-          'buffer',
-          {},
-          { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
-        );
-      } catch {
+        try {
+          buffer = await download(target);
+        } catch (error) {
+          if (!askPhone || !isExpiredMedia(error, link)) throw error;
+          let refreshed: WAMessage;
+          try {
+            refreshed = await reuploadRequest(target);
+          } catch {
+            // The download's own error stands; the log already says how the re-upload ended.
+            throw error;
+          }
+          buffer = await download(refreshed);
+        }
+      } catch (error) {
+        const status = httpStatus(error);
+        this.logger.error(`media download: ${media}, outcome=download_failed, status=${status}, reupload=${reupload}`);
+        if (!askPhone && isExpiredMedia(error, link)) {
+          throw `The media is no longer on WhatsApp's servers (HTTP ${status}), and no re-upload from the phone was attempted (reupload: false)`;
+        }
         this.logger.error('Download Media failed, trying to retry in 5 seconds...');
         await new Promise((resolve) => setTimeout(resolve, 5000));
         const mediaType = Object.keys(msg.message).find((key) => key.endsWith('Message'));
@@ -3916,7 +5011,7 @@ export class BaileysStartupService extends ChannelStartupService {
               url: `https://mmg.whatsapp.net${msg?.message?.[mediaType]?.directPath}`,
             },
             await this.mapMediaType(mediaType),
-            {},
+            this.mediaDownloadOptions(),
           );
           const chunks = [];
           for await (const chunk of media) {
@@ -3925,7 +5020,10 @@ export class BaileysStartupService extends ChannelStartupService {
           buffer = Buffer.concat(chunks);
           this.logger.info('Download Media with downloadContentFromMessage was successful!');
         } catch (fallbackErr) {
-          this.logger.error('Download Media with downloadContentFromMessage also failed!');
+          // Its error carries the signed media URL (message and data.url): name and status only.
+          this.logger.error(
+            `media fallback: ${media}, outcome=failed, error=${errorName(fallbackErr)}, status=${httpStatus(fallbackErr)}`,
+          );
           throw fallbackErr;
         }
       }
@@ -3972,9 +5070,18 @@ export class BaileysStartupService extends ChannelStartupService {
         buffer: getBuffer ? buffer : null,
       };
     } catch (error) {
-      this.logger.error('Error processing media message:');
-      this.logger.error(error);
-      throw new BadRequestException(error.toString());
+      const key = data?.message?.key;
+      this.logger.error(
+        `media processing failed: message=${key?.id}, chat=${jidKind(key?.remoteJid)}, error=${errorName(error)}, status=${httpStatus(error)}`,
+      );
+      if (reupload === undefined) throw new BadRequestException(error.toString());
+      // The same 400, plus whether the phone was asked to re-upload the file, and why it refused.
+      // Never the error's own text, which names the signed media link (mediaDownloadFailure).
+      try {
+        new BadRequestException(mediaDownloadFailure(error));
+      } catch (badRequest) {
+        throw { ...badRequest, reupload, ...(reuploadReason && { reuploadReason }) };
+      }
     }
   }
 
@@ -4284,16 +5391,32 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   // Group
+  private async keepGroupMetadata(groupJid: string, meta: GroupMetadata) {
+    const cacheConf = this.configService.get<CacheConf>('CACHE');
+
+    if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
+      this.logger.verbose(`Updating cache for group: ${groupJid}`);
+      await groupMetadataCache.set(groupJid, { timestamp: Date.now(), data: meta });
+    }
+  }
+
+  /** Refetch a group's metadata in the background: one query per group at a time, a few groups at once. */
+  private refreshGroupMetadata(groupJid: string) {
+    let refresh = this.groupRefreshes.get(groupJid);
+    if (!refresh) {
+      refresh = this.backgroundQueries
+        .run(() => this.updateGroupMetadataCache(groupJid))
+        .finally(() => this.groupRefreshes.delete(groupJid));
+      this.groupRefreshes.set(groupJid, refresh);
+    }
+    return refresh;
+  }
+
   private async updateGroupMetadataCache(groupJid: string) {
     try {
       const meta = await this.client.groupMetadata(groupJid);
 
-      const cacheConf = this.configService.get<CacheConf>('CACHE');
-
-      if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
-        this.logger.verbose(`Updating cache for group: ${groupJid}`);
-        await groupMetadataCache.set(groupJid, { timestamp: Date.now(), data: meta });
-      }
+      await this.keepGroupMetadata(groupJid, meta);
 
       return meta;
     } catch (error) {
@@ -4309,7 +5432,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
       if (await groupMetadataCache?.has(groupJid)) {
-        console.log(`Cache request for group: ${groupJid}`);
+        this.logger.verbose('Cache request for group: found');
         const meta = await groupMetadataCache.get(groupJid);
 
         if (Date.now() - meta.timestamp > 3600000) {
@@ -4319,7 +5442,7 @@ export class BaileysStartupService extends ChannelStartupService {
         return meta.data;
       }
 
-      console.log(`Cache request for group: ${groupJid} - not found`);
+      this.logger.verbose('Cache request for group: not found');
       return await this.updateGroupMetadataCache(groupJid);
     }
 
@@ -4450,7 +5573,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
     let groups = [];
     for (const group of fetch) {
-      const picture = await this.profilePicture(group.id);
+      const picture = await this.cachedProfilePicture(group.id);
 
       const result = {
         id: group.id,
@@ -4860,7 +5983,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async baileysSendNode(stanza: any) {
-    console.log('stanza', JSON.stringify(stanza));
+    this.logger.verbose(`stanza ${stanza?.tag ?? ''}`);
     const response = await this.client.sendNode(stanza);
 
     return response;

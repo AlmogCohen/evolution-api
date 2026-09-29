@@ -17,6 +17,20 @@ export type EmitData = {
   extra?: Record<string, any>;
 };
 
+// Group updates have two spellings. Baileys emits groups.update, GROUPS_UPDATE once
+// upper-cased, but every /<transport>/set schema (EventController.events) and every
+// global env config except SQS's stores it as GROUP_UPDATE. Both are accepted and
+// neither is renamed, so a subscription stored under either name keeps working.
+const EVENT_ALIASES: Record<string, string[]> = { GROUPS_UPDATE: ['GROUPS_UPDATE', 'GROUP_UPDATE'] };
+
+/** Whether `subscribed` (an instance's stored event names, or a global config's flags) includes the event `we`. */
+export function isSubscribed(subscribed: unknown, we: string): boolean {
+  const names = EVENT_ALIASES[we] ?? [we];
+  if (Array.isArray(subscribed)) return names.some((name) => subscribed.includes(name));
+  if (subscribed && typeof subscribed === 'object') return names.some((name) => !!subscribed[name]);
+  return false;
+}
+
 export interface EventControllerInterface {
   set(instanceName: string, data: any): Promise<any>;
   get(instanceName: string): Promise<any>;

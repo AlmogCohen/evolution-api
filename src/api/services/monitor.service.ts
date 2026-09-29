@@ -7,9 +7,11 @@ import { CacheConf, Chatwoot, ConfigService, Database, DelInstance, ProviderSess
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR, STORE_DIR } from '@config/path.config';
 import { NotFoundException } from '@exceptions';
+import { errorFields } from '@utils/log-privacy';
+import { readLogoutMarker } from '@utils/logout-marker';
 import { execFileSync } from 'child_process';
 import EventEmitter2 from 'eventemitter2';
-import { rmSync } from 'fs';
+import { readdirSync, rmSync } from 'fs';
 import { join } from 'path';
 
 import { CacheService } from './cache.service';
@@ -26,6 +28,11 @@ export class WAMonitoringService {
   ) {
     this.removeInstance();
     this.noConnection();
+    this.eventEmitter.on('logout.finished', (instance: any) => {
+      for (const [name, finishing] of Object.entries(this.finishingLogouts)) {
+        if (finishing === instance) delete this.finishingLogouts[name];
+      }
+    });
 
     Object.assign(this.db, configService.get<Database>('DATABASE'));
     Object.assign(this.redis, configService.get<CacheConf>('CACHE'));
@@ -38,6 +45,8 @@ export class WAMonitoringService {
 
   private readonly logger = new Logger('WAMonitoringService');
   public readonly waInstances: Record<string, any> = {};
+  // Deleted instances whose logout has not reached WhatsApp yet, by name: out of the API, finishing it.
+  public readonly finishingLogouts: Record<string, any> = {};
   private readonly delInstanceTimeouts: Record<string, NodeJS.Timeout> = {};
 
   private readonly providerSession: ProviderSession;
@@ -96,6 +105,8 @@ export class WAMonitoringService {
 
     const clientName = this.configService.get<Database>('DATABASE').CONNECTION.CLIENT_NAME;
 
+    // A deleted instance finishing its logout keeps its row until then, out of the API.
+    const finishing = Object.keys(this.finishingLogouts);
     const where =
       instanceNames && instanceNames.length > 0
         ? {
@@ -104,7 +115,7 @@ export class WAMonitoringService {
             },
             clientName,
           }
-        : { clientName };
+        : { clientName, ...(finishing.length ? { name: { notIn: finishing } } : {}) };
 
     const instances = await this.prismaRepository.instance.findMany({
       where,
@@ -188,7 +199,13 @@ export class WAMonitoringService {
     }
   }
 
-  public async cleaningStoreData(instanceName: string) {
+  /**
+   * `keepForLogout`: keep what a pending logout still needs: the session (creds, key files, logout
+   * marker), the proxy, and the Instance row itself, since Session and Proxy reference it ON DELETE
+   * CASCADE. Its token is cleared, so the deleted instance's key authenticates nothing. The row goes
+   * when the logout has reached WhatsApp (BaileysStartupService.finishLogout).
+   */
+  public async cleaningStoreData(instanceName: string, { keepForLogout = false } = {}) {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
       const instancePath = join(STORE_DIR, 'chatwoot', instanceName);
       execFileSync('rm', ['-rf', instancePath]);
@@ -200,9 +217,11 @@ export class WAMonitoringService {
 
     if (!instance) return;
 
-    rmSync(join(INSTANCE_DIR, instance.id), { recursive: true, force: true });
+    if (!keepForLogout) {
+      rmSync(join(INSTANCE_DIR, instance.id), { recursive: true, force: true });
 
-    await this.prismaRepository.session.deleteMany({ where: { sessionId: instance.id } });
+      await this.prismaRepository.session.deleteMany({ where: { sessionId: instance.id } });
+    }
 
     await this.prismaRepository.chat.deleteMany({ where: { instanceId: instance.id } });
     await this.prismaRepository.contact.deleteMany({ where: { instanceId: instance.id } });
@@ -211,7 +230,7 @@ export class WAMonitoringService {
 
     await this.prismaRepository.webhook.deleteMany({ where: { instanceId: instance.id } });
     await this.prismaRepository.chatwoot.deleteMany({ where: { instanceId: instance.id } });
-    await this.prismaRepository.proxy.deleteMany({ where: { instanceId: instance.id } });
+    if (!keepForLogout) await this.prismaRepository.proxy.deleteMany({ where: { instanceId: instance.id } });
     await this.prismaRepository.rabbitmq.deleteMany({ where: { instanceId: instance.id } });
     await this.prismaRepository.nats.deleteMany({ where: { instanceId: instance.id } });
     await this.prismaRepository.sqs.deleteMany({ where: { instanceId: instance.id } });
@@ -221,6 +240,10 @@ export class WAMonitoringService {
     await this.prismaRepository.setting.deleteMany({ where: { instanceId: instance.id } });
     await this.prismaRepository.label.deleteMany({ where: { instanceId: instance.id } });
 
+    if (keepForLogout) {
+      await this.prismaRepository.instance.update({ where: { id: instance.id }, data: { token: null } });
+      return;
+    }
     await this.prismaRepository.instance.delete({ where: { name: instanceName } });
   }
 
@@ -233,8 +256,56 @@ export class WAMonitoringService {
       } else if (this.redis.REDIS.ENABLED && this.redis.REDIS.SAVE_INSTANCES) {
         await this.loadInstancesFromRedis();
       }
+      await this.resumeDeletedLogouts();
     } catch (error) {
       this.logger.error(error);
+    }
+  }
+
+  /**
+   * Delete while the logout could not reach WhatsApp: the instance leaves the API now (memory and
+   * everything stored for it), keeping only its row, session and proxy, and finishes the logout in
+   * the background. The service removes those when it has (BaileysStartupService.finishLogout).
+   */
+  public async deleteKeepingLogout(instanceName: string) {
+    const instance = this.waInstances[instanceName];
+    await instance.markLogoutDeleted();
+    this.finishingLogouts[instanceName] = instance;
+    this.clearDelInstanceTime(instanceName);
+    delete this.waInstances[instanceName];
+    await this.cleaningStoreData(instanceName, { keepForLogout: true });
+    this.logger.warn(`Instance "${instanceName}" - REMOVED, its logout pending`);
+  }
+
+  /**
+   * On boot: a deleted instance with no row whose logout marker is still there finishes its logout.
+   * Only a delete made before the row was kept leaves that (its session went with the row); a row
+   * that is still there is loaded by setInstance.
+   */
+  private async resumeDeletedLogouts() {
+    let ids: string[];
+    try {
+      ids = readdirSync(INSTANCE_DIR);
+    } catch {
+      return;
+    }
+    for (const instanceId of ids) {
+      const marker = readLogoutMarker(instanceId);
+      if (!marker?.deleted || !marker.instanceName) continue;
+      if (await this.prismaRepository.instance.findUnique({ where: { id: instanceId } })) continue;
+      const instanceData = { instanceId, instanceName: marker.instanceName, integration: Integration.WHATSAPP_BAILEYS };
+      const instance = channelController.init(instanceData, {
+        configService: this.configService,
+        eventEmitter: this.eventEmitter,
+        prismaRepository: this.prismaRepository,
+        cache: this.cache,
+        chatwootCache: this.chatwootCache,
+        baileysCache: this.baileysCache,
+        providerFiles: this.providerFiles,
+      });
+      instance.setInstance(instanceData);
+      this.finishingLogouts[marker.instanceName] = instance;
+      await (instance as any).resumePendingLogout();
     }
   }
 
@@ -293,18 +364,50 @@ export class WAMonitoringService {
       ownerJid: instanceData.ownerJid,
     });
 
+    // A logout that had not reached WhatsApp before the restart: connect only to deliver it. A
+    // deleted instance's row is kept until then, and it stays out of the API (finishingLogouts).
+    const pending = await (instance as any).pendingLogout?.();
+    if (pending) {
+      if (pending.deleted) this.finishingLogouts[instanceData.instanceName] = instance;
+      else this.waInstances[instanceData.instanceName] = instance;
+      await (instance as any).resumePendingLogout(pending);
+      return;
+    }
+
+    // In the API before it connects: a connect that fails (a database read, the network) must not
+    // leave the instance out of it until the process restarts.
+    this.waInstances[instanceData.instanceName] = instance;
+
     if (instanceData.connectionStatus === 'open' || instanceData.connectionStatus === 'connecting') {
       this.logger.info(
         `Auto-connecting instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus})`,
       );
-      await instance.connectToWhatsapp();
+      try {
+        await instance.connectToWhatsapp();
+      } catch (error) {
+        this.logger.error({
+          message: `Auto-connect of instance "${instanceData.instanceName}" failed, retrying`,
+          error: errorFields(error?.cause ?? error),
+        });
+        (instance as any).retryConnect?.();
+      }
     } else {
       this.logger.info(
         `Skipping auto-connect for instance "${instanceData.instanceName}" (status: ${instanceData.connectionStatus || 'close'})`,
       );
     }
+  }
 
-    this.waInstances[instanceData.instanceName] = instance;
+  /** setInstance for a loader: awaited, and one instance's failure never stops the others. */
+  private async loadOne(instanceData: InstanceDto) {
+    try {
+      await this.setInstance(instanceData);
+    } catch (error) {
+      this.logger.error({
+        message: `Loading instance "${instanceData.instanceName}" failed`,
+        error: errorFields(error),
+      });
+    }
   }
 
   private async loadInstancesFromRedis() {
@@ -331,7 +434,7 @@ export class WAMonitoringService {
             connectionStatus: instanceData.connectionStatus as any, // Pass connection status
           };
 
-          this.setInstance(instance);
+          await this.loadOne(instance);
         }),
       );
     }
@@ -350,7 +453,7 @@ export class WAMonitoringService {
 
     await Promise.all(
       instances.map(async (instance) => {
-        this.setInstance({
+        await this.loadOne({
           instanceId: instance.id,
           instanceName: instance.name,
           integration: instance.integration,
@@ -377,7 +480,7 @@ export class WAMonitoringService {
           where: { id: instanceId },
         });
 
-        this.setInstance({
+        await this.loadOne({
           instanceId: instance.id,
           instanceName: instance.name,
           integration: instance.integration,
@@ -392,6 +495,8 @@ export class WAMonitoringService {
   private removeInstance() {
     this.eventEmitter.on('remove.instance', async (instanceName: string) => {
       try {
+        // No reconnect waiting on its backoff may bring the removed instance back, and its socket goes too.
+        this.waInstances[instanceName]?.shutdown?.();
         await this.waInstances[instanceName]?.sendDataWebhook(Events.REMOVE_INSTANCE, null);
 
         this.clearDelInstanceTime(instanceName);

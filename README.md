@@ -1,3 +1,5 @@
+> **Unofficial fork** of Evolution API 2.3.7, made test first. Not endorsed by Evolution Foundation. See [FORK.md](FORK.md) for what changed and why.
+
 <h1 align="center">Evolution Api</h1>
 
 <div align="center">

@@ -112,6 +112,9 @@ async function bootstrap() {
           error: err['error'] || 'Internal Server Error',
           response: {
             message: err['message'] || 'Internal Server Error',
+            // A failed media download says whether the phone was asked to re-upload the file, and why it refused.
+            ...(err['reupload'] !== undefined && { reupload: err['reupload'] }),
+            ...(err['reuploadReason'] !== undefined && { reuploadReason: err['reuploadReason'] }),
           },
         });
       }

@@ -3,6 +3,7 @@ import { CacheService } from '@api/services/cache.service';
 import { CacheConf, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR } from '@config/path.config';
+import { removeStaleTempFiles, writeFileAtomic } from '@utils/atomic-file';
 import { AuthenticationState, BufferJSON, initAuthCreds, WAProto as proto } from 'baileys';
 import fs from 'fs/promises';
 import path from 'path';
@@ -16,42 +17,46 @@ const fixFileName = (file: string): string | undefined => {
   return replacedColon;
 };
 
+// A database error is not an absent session. keyExists and getAuthKey let it
+// propagate: turned into "no session", it made the store start a fresh one and
+// save it over the linked creds once the database answered again.
 export async function keyExists(sessionId: string): Promise<any> {
-  try {
-    const key = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
-    return !!key;
-  } catch {
-    return false;
-  }
+  const key = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
+  return !!key;
 }
 
+// A failed write is not a saved one: saveKey lets it propagate, so saveCreds rejects and its
+// caller can try again, instead of running on creds that exist only in memory.
 export async function saveKey(sessionId: string, keyJson: any): Promise<any> {
   const exists = await keyExists(sessionId);
-  try {
-    if (!exists)
-      return await prismaRepository.session.create({
-        data: {
-          sessionId: sessionId,
-          creds: JSON.stringify(keyJson),
-        },
-      });
-    await prismaRepository.session.update({
-      where: { sessionId: sessionId },
-      data: { creds: JSON.stringify(keyJson) },
+  if (!exists)
+    return await prismaRepository.session.create({
+      data: {
+        sessionId: sessionId,
+        creds: JSON.stringify(keyJson),
+      },
     });
-  } catch {
-    return null;
+  await prismaRepository.session.update({
+    where: { sessionId: sessionId },
+    data: { creds: JSON.stringify(keyJson) },
+  });
+}
+
+/** Stored creds that cannot be read are not an absent session: starting fresh would overwrite them. */
+export class UnreadableCredsError extends Error {
+  constructor(sessionId: string) {
+    super(`The stored creds of session ${sessionId} cannot be read: not replacing them`);
+    this.name = 'UnreadableCredsError';
   }
 }
 
 export async function getAuthKey(sessionId: string): Promise<any> {
+  const auth = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
+  if (!auth) return null;
   try {
-    const register = await keyExists(sessionId);
-    if (!register) return null;
-    const auth = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
-    return JSON.parse(auth?.creds);
+    return JSON.parse(auth.creds);
   } catch {
-    return null;
+    throw new UnreadableCredsError(sessionId);
   }
 }
 
@@ -87,6 +92,8 @@ export default async function useMultiFileAuthStatePrisma(
   const localFolder = path.join(INSTANCE_DIR, sessionId);
   const localFile = (key: string) => path.join(localFolder, fixFileName(key) + '.json');
   await fs.mkdir(localFolder, { recursive: true });
+  // What a writer killed mid-write left behind; the key files themselves are always whole.
+  await removeStaleTempFiles(localFolder);
 
   async function writeData(data: any, key: string): Promise<any> {
     const dataString = JSON.stringify(data, BufferJSON.replacer);
@@ -96,7 +103,8 @@ export default async function useMultiFileAuthStatePrisma(
       if (cacheConfig.REDIS.ENABLED) {
         return await cache.hSet(sessionId, key, data);
       } else {
-        await fs.writeFile(localFile(key), dataString);
+        // Replaced whole, never in place: a torn key file reads as no key (atomic-file.ts).
+        await writeFileAtomic(localFile(key), dataString);
         return;
       }
     }
@@ -105,6 +113,8 @@ export default async function useMultiFileAuthStatePrisma(
   }
 
   async function readData(key: string): Promise<any> {
+    // Outside the try below: a failed creds read must fail the open, never read as "no creds".
+    const storedCreds = key === 'creds' ? await getAuthKey(sessionId) : undefined;
     try {
       let rawData;
       const cacheConfig = configService.get<CacheConf>('CACHE');
@@ -118,12 +128,15 @@ export default async function useMultiFileAuthStatePrisma(
           return JSON.parse(rawData, BufferJSON.reviver);
         }
       } else {
-        rawData = await getAuthKey(sessionId);
+        if (storedCreds === null || storedCreds === undefined) return null;
+        try {
+          return JSON.parse(storedCreds, BufferJSON.reviver);
+        } catch {
+          throw new UnreadableCredsError(sessionId);
+        }
       }
-
-      const parsedData = JSON.parse(rawData, BufferJSON.reviver);
-      return parsedData;
-    } catch {
+    } catch (error) {
+      if (error instanceof UnreadableCredsError) throw error;
       return null;
     }
   }
@@ -182,7 +195,7 @@ export default async function useMultiFileAuthStatePrisma(
             ids.map(async (id) => {
               let value = await readData(`${type}-${id}`);
               if (type === 'app-state-sync-key' && value) {
-                value = proto.Message.AppStateSyncKeyData.create(value);
+                value = proto.Message.AppStateSyncKeyData.fromObject(value);
               }
 
               data[id] = value;

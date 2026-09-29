@@ -5,6 +5,8 @@ import { BadRequestException, ForbiddenException, InternalServerErrorException, 
 import { NextFunction, Request, Response } from 'express';
 
 async function getInstance(instanceName: string) {
+  // A deleted instance keeps its row while its logout is pending, but is gone from the API.
+  if (waMonitor.finishingLogouts?.[instanceName]) return false;
   try {
     const cacheConf = configService.get<CacheConf>('CACHE');
 
@@ -32,7 +34,11 @@ export async function instanceExistsGuard(req: Request, _: Response, next: NextF
     throw new BadRequestException('"instanceName" not provided.');
   }
 
-  if (!(await getInstance(param.instanceName))) {
+  // A deleted instance whose logout has not reached WhatsApp yet answers connectionState, nothing else.
+  const finishingLogout =
+    req.originalUrl.includes('/instance/connectionState/') && !!waMonitor.finishingLogouts?.[param.instanceName];
+
+  if (!finishingLogout && !(await getInstance(param.instanceName))) {
     throw new NotFoundException(`The "${param.instanceName}" instance does not exist`);
   }
 
@@ -42,7 +48,8 @@ export async function instanceExistsGuard(req: Request, _: Response, next: NextF
 export async function instanceLoggedGuard(req: Request, _: Response, next: NextFunction) {
   if (req.originalUrl.includes('/instance/create')) {
     const instance = req.body as InstanceDto;
-    if (await getInstance(instance.instanceName)) {
+    // The name of a deleted instance stays taken until its logout has reached WhatsApp.
+    if ((await getInstance(instance.instanceName)) || waMonitor.finishingLogouts?.[instance.instanceName]) {
       throw new ForbiddenException(`This name "${instance.instanceName}" is already in use.`);
     }
 

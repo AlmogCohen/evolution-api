@@ -3,6 +3,7 @@ import { CacheService } from '@api/services/cache.service';
 import { CacheConf, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR } from '@config/path.config';
+import { removeStaleTempFiles, writeFileAtomic } from '@utils/atomic-file';
 import { AuthenticationState, BufferJSON, initAuthCreds, WAProto as proto } from 'baileys';
 import fs from 'fs/promises';
 import path from 'path';
@@ -91,6 +92,8 @@ export default async function useMultiFileAuthStatePrisma(
   const localFolder = path.join(INSTANCE_DIR, sessionId);
   const localFile = (key: string) => path.join(localFolder, fixFileName(key) + '.json');
   await fs.mkdir(localFolder, { recursive: true });
+  // What a writer killed mid-write left behind; the key files themselves are always whole.
+  await removeStaleTempFiles(localFolder);
 
   async function writeData(data: any, key: string): Promise<any> {
     const dataString = JSON.stringify(data, BufferJSON.replacer);
@@ -100,7 +103,8 @@ export default async function useMultiFileAuthStatePrisma(
       if (cacheConfig.REDIS.ENABLED) {
         return await cache.hSet(sessionId, key, data);
       } else {
-        await fs.writeFile(localFile(key), dataString);
+        // Replaced whole, never in place: a torn key file reads as no key (atomic-file.ts).
+        await writeFileAtomic(localFile(key), dataString);
         return;
       }
     }

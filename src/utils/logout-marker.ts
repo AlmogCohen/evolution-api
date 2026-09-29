@@ -1,6 +1,7 @@
 import { INSTANCE_DIR } from '@config/path.config';
+import { writeFileAtomic } from '@utils/atomic-file';
 import { existsSync, readFileSync } from 'fs';
-import { mkdir, writeFile } from 'fs/promises';
+import { mkdir } from 'fs/promises';
 import { join } from 'path';
 
 /**
@@ -30,5 +31,6 @@ export function readLogoutMarker(instanceId: string): LogoutMarker | undefined {
 
 export async function writeLogoutMarker(instanceId: string, marker: LogoutMarker) {
   await mkdir(join(INSTANCE_DIR, instanceId), { recursive: true });
-  await writeFile(logoutMarkerPath(instanceId), JSON.stringify(marker));
+  // Replaced whole: a marker half-written over the last one would lose the instance's name.
+  await writeFileAtomic(logoutMarkerPath(instanceId), JSON.stringify(marker));
 }

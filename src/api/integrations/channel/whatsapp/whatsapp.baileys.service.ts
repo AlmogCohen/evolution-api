@@ -274,6 +274,27 @@ const reuploadRefusal = (error: any): string => {
 };
 
 /**
+ * What a failed media download answers with, instead of the error's own text. Baileys'
+ * download error says "Failed to fetch stream from <the link>" and carries the link (Boom
+ * data.url); a WhatsApp media link is signed per message (oh, oe, the _nc_ parameters), so
+ * whoever holds it can fetch the file, and even its directPath alone names the file. So the
+ * answer says what failed and never where: the CDN's HTTP status, else the kind of error and
+ * its network code. A text Evolution threw itself (it names no link) stands, as does the
+ * message of an answer already built here (the MP4 conversion's 400).
+ */
+const mediaDownloadFailure = (error: any): string => {
+  if (typeof error === 'string') return error;
+  if (!(error instanceof Error) && Array.isArray(error?.message) && typeof error.message[0] === 'string') {
+    return error.message[0];
+  }
+  const status = httpStatus(error);
+  if (typeof status === 'number') return `The media could not be downloaded (HTTP ${status})`;
+  const code = error?.cause?.code ?? error?.code;
+  const network = typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,40}$/.test(code) ? `, ${code}` : '';
+  return `The media could not be downloaded (${errorName(error)}${network})`;
+};
+
+/**
  * When a WhatsApp media link stops working, in ms: its `oe` query parameter (hex unix
  * seconds). Read with URLSearchParams, so the name is case-sensitive, the value is
  * percent-decoded and a fragment never counts. Undefined unless the query carries exactly
@@ -5055,8 +5076,9 @@ export class BaileysStartupService extends ChannelStartupService {
       );
       if (reupload === undefined) throw new BadRequestException(error.toString());
       // The same 400, plus whether the phone was asked to re-upload the file, and why it refused.
+      // Never the error's own text, which names the signed media link (mediaDownloadFailure).
       try {
-        new BadRequestException(error.toString());
+        new BadRequestException(mediaDownloadFailure(error));
       } catch (badRequest) {
         throw { ...badRequest, reupload, ...(reuploadReason && { reuploadReason }) };
       }

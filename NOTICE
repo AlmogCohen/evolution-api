@@ -7,8 +7,9 @@ This product includes software developed by Evolution Foundation
 Trademark notice
 "Evolution Foundation", "Evolution" and "Evolution API" are trademarks of
 Evolution Foundation. The Evolution API logo, wordmark, and visual identity
-are governed by the Trademark and Brand Assets Policy included in this
-repository (TRADEMARKS.md).
+are governed by Evolution Foundation's Trademark and Brand Assets Policy
+(https://github.com/evolution-foundation/evolution-api/blob/main/TRADEMARKS.md).
+This fork does not change the Evolution API user interface or its brand assets.
 
 Third-party attributions
 

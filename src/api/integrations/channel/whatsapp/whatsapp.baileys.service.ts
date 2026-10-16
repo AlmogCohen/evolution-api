@@ -5778,8 +5778,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const messageRaw = {
       key: message.key, // Save key exactly as it comes from Baileys
+      // A business account can send no push name, only the verified name WhatsApp
+      // certifies for it (test/handlers/verified-business-name.test.ts).
       pushName:
         message.pushName ||
+        message.verifiedBizName ||
         (message.key.fromMe
           ? 'Você'
           : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),

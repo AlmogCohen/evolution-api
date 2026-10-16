@@ -6,7 +6,7 @@ import { configService, Log, Pusher as ConfigPusher } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import Pusher from 'pusher';
 
-import { EmitData, EventController, EventControllerInterface } from '../event.controller';
+import { EmitData, EventController, EventControllerInterface, isSubscribed } from '../event.controller';
 export class PusherController extends EventController implements EventControllerInterface {
   private readonly logger = new Logger('PusherController');
   private pusherClients: { [instanceName: string]: Pusher } = {};
@@ -162,7 +162,7 @@ export class PusherController extends EventController implements EventController
     }
     if (local && instance && instance.enabled) {
       const pusherLocalEvents = instance.events;
-      if (Array.isArray(pusherLocalEvents) && pusherLocalEvents.includes(we)) {
+      if (isSubscribed(pusherLocalEvents, we)) {
         if (enabledLog) {
           this.logger.log({
             local: `${origin}.sendData-Pusher`,
@@ -188,7 +188,7 @@ export class PusherController extends EventController implements EventController
     }
     if (this.pusherConfig.GLOBAL?.ENABLED) {
       const globalEvents = this.pusherConfig.EVENTS;
-      if (globalEvents[we]) {
+      if (isSubscribed(globalEvents, we)) {
         if (enabledLog) {
           this.logger.log({
             local: `${origin}.sendData-Pusher-Global`,

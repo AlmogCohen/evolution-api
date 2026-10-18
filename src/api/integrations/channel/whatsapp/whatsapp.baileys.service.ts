@@ -1151,7 +1151,11 @@ export class BaileysStartupService extends ChannelStartupService {
     // A QR link and a link by phone number (pairing code) present the same way.
     // Until 2026-10-18 only a QR link took CONFIG_SESSION_PHONE; a pairing code
     // took Baileys' default, whatever was configured.
-    const browser = this.linkBrowser(authState.state.creds, [session.CLIENT, session.NAME, release()]);
+    // 'Mac OS' is Baileys' own description (Browsers.macOS), so Mac OS + Chrome is
+    // exactly the default a pairing-code link always had.
+    const configured: WABrowserDescription =
+      session.CLIENT === 'Mac OS' ? Browsers.macOS(session.NAME) : [session.CLIENT, session.NAME, release()];
+    const browser = this.linkBrowser(authState.state.creds, configured);
     const browserOptions = { browser };
     this.logger.info(`Browser: ${browser}`);
 

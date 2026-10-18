@@ -100,6 +100,22 @@ describe('what a new link presents as', () => {
   });
 });
 
+describe('code linking as it is today', () => {
+  it('PROMISE: configured as Mac OS + Chrome, a code link presents exactly as Baileys default did', async () => {
+    process.env.CONFIG_SESSION_PHONE_CLIENT = 'Mac OS';
+    process.env.CONFIG_SESSION_PHONE_NAME = 'Chrome';
+    const { service } = await makeService();
+    service.defineAuthState = async () => ({
+      state: { creds: initAuthCreds(), keys: { get: async () => ({}), set: async () => undefined } },
+      saveCreds: async () => undefined,
+      removeCreds: async () => undefined,
+    });
+    const before = socketSpy.mock.calls.length;
+    await service.connectToWhatsapp('972500000009');
+    expect(socketSpy.mock.calls[before][0].browser).toEqual(Browsers.macOS('Chrome'));
+  });
+});
+
 describe('a session already linked', () => {
   it('the browser changes the login: a desktop logs in as DARWIN, a browser as WEB_BROWSER', () => {
     expect(login(['Mac OS', 'Desktop', '6.1.0'])).not.toBe(login(['Evolution API', 'Chrome', '6.1.0']));

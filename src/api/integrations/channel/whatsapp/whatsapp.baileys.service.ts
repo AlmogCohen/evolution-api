@@ -99,6 +99,7 @@ import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-r
 import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
+  Browsers,
   BufferedEventData,
   BufferJSON,
   CacheStore,
@@ -1112,6 +1113,27 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  /**
+   * What this link presents itself to WhatsApp as.
+   *
+   * The phone sizes a new device's first history sync by what it says it is:
+   * a browser gets about a year, a desktop more (Baileys README, "Receive Full
+   * History"). But the browser also shapes every later login
+   * (generateLoginNode: 'Mac OS' + 'Desktop' logs in as webSubPlatform DARWIN,
+   * anything else as WEB_BROWSER), so changing the setting must not move a
+   * session that is already linked.
+   *
+   * A new link takes the configured browser and remembers it on its creds
+   * (`linkedAs`, saved with them). A linked session presents as what it linked
+   * as. One linked before this has no record and keeps the login it always had:
+   * a browser, Baileys' default.
+   */
+  private linkBrowser(creds: any, configured: WABrowserDescription): WABrowserDescription {
+    if (creds?.me) return creds.linkedAs ?? Browsers.macOS('Chrome');
+    if (creds) creds.linkedAs = configured;
+    return configured;
+  }
+
   private async createClient(number?: string): Promise<WASocket> {
     this.stillWanted();
     const authState = await this.defineAuthState();
@@ -1120,18 +1142,18 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
 
-    let browserOptions = {};
-
     if (number || this.phoneNumber) {
       this.phoneNumber = number;
 
       this.logger.info(`Phone number: ${number}`);
-    } else {
-      const browser: WABrowserDescription = [session.CLIENT, session.NAME, release()];
-      browserOptions = { browser };
-
-      this.logger.info(`Browser: ${browser}`);
     }
+
+    // A QR link and a link by phone number (pairing code) present the same way.
+    // Until 2026-10-18 only a QR link took CONFIG_SESSION_PHONE; a pairing code
+    // took Baileys' default, whatever was configured.
+    const browser = this.linkBrowser(authState.state.creds, [session.CLIENT, session.NAME, release()]);
+    const browserOptions = { browser };
+    this.logger.info(`Browser: ${browser}`);
 
     let options;
 

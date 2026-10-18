@@ -38,6 +38,7 @@ import {
   profileStatusSchema,
   readMessageSchema,
   updateMessageSchema,
+  verifiedNameSchema,
   whatsappNumberSchema,
 } from '@validate/validate.schema';
 import { RequestHandler, Router } from 'express';
@@ -214,6 +215,16 @@ export class ChatRouter extends RouterBroker {
         });
 
         return res.status(HttpStatus.CREATED).json(response);
+      })
+      .post(this.routerPath('fetchVerifiedName'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<NumberDto>({
+          request: req,
+          schema: verifiedNameSchema,
+          ClassRef: NumberDto,
+          execute: (instance, data) => chatController.fetchVerifiedName(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
       })
       // Profile routes
       .post(this.routerPath('fetchBusinessProfile'), ...guards, async (req, res) => {

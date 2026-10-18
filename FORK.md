@@ -63,6 +63,7 @@ named where one exists.
 
 - `POST /chat/fetchHistory` (`{ key: { remoteJid, fromMe, id }, timestampMs, count? }`, count 1 to 50, default 50) asks the phone to send a chat's history again, older than the message `key` names (Baileys' `fetchMessageHistory`, WhatsApp's on-demand history request), and answers `201 { requestId }`. The phone answers later, if at all, with an ON_DEMAND history batch forwarded as `messages.set`. Until now the request was reachable only by sending yourself "onDemandHistSync".
 - A history message with no push name from a WhatsApp Business account carries its verified business name (`verifiedBizName`) as `pushName`, as a live one has since the change above, instead of its sender's number.
+- `POST /chat/fetchVerifiedName` (`{ number }`, a number or a JID) answers `{ jid, verifiedName }`: the name WhatsApp certifies for a WhatsApp Business account (a usync `business` query for `verified_name`, the certificate a live message carries), or `null` for anyone else. A history page the phone sends again can carry neither a push name nor `verifiedBizName` (ESHUV, 2026-10-18), so a consumer asks.
 
 **Proxy**
 - Media downloads, media uploads and the WhatsApp Web version fetch leave through the instance's proxy (uploads failed outright on a proxied instance).

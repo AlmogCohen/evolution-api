@@ -91,6 +91,10 @@ export class ChatController {
     return await this.waMonitor.waInstances[instanceName].fetchHistory(data);
   }
 
+  public async fetchVerifiedName({ instanceName }: InstanceDto, data: NumberDto) {
+    return await this.waMonitor.waInstances[instanceName].fetchVerifiedName(data.number);
+  }
+
   public async fetchBusinessProfile({ instanceName }: InstanceDto, data: ProfilePictureDto) {
     return await this.waMonitor.waInstances[instanceName].fetchBusinessProfile(data.number);
   }

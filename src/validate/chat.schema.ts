@@ -159,6 +159,15 @@ export const fetchHistorySchema: JSONSchema7 = {
   required: ['key', 'timestampMs'],
 };
 
+export const verifiedNameSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    number: { type: 'string', minLength: 1 },
+  },
+  required: ['number'],
+};
+
 export const profilePictureSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

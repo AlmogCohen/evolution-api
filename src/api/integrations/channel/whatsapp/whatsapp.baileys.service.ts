@@ -134,6 +134,8 @@ import makeWASocket, {
   proto,
   S_WHATSAPP_NET,
   UserFacingSocketConfig,
+  USyncQuery,
+  USyncUser,
   WABrowserDescription,
   WAMediaUpload,
   WAMessage,
@@ -163,6 +165,7 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { USyncVerifiedNameProtocol } from './verified-name.protocol';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -5138,6 +5141,18 @@ export class BaileysStartupService extends ChannelStartupService {
     const anchor = { remoteJid: key.remoteJid, fromMe: key.fromMe, id: key.id };
     const requestId = await this.client.fetchMessageHistory(count ?? 50, anchor, timestampMs);
     return { requestId };
+  }
+
+  /** The name WhatsApp certifies for a business account (usync business/verified_name); null for anyone else. */
+  public async fetchVerifiedName(number: string) {
+    const jid = createJid(number);
+    const query = new USyncQuery().withUser(new USyncUser().withId(jid));
+    query.protocols.push(new USyncVerifiedNameProtocol() as any);
+    const result = await this.client.executeUSyncQuery(query);
+    const user = result?.list?.find((u: any) => u.id === jid) as
+      | { business?: { verifiedName: string | null } }
+      | undefined;
+    return { jid, verifiedName: user?.business?.verifiedName ?? null };
   }
 
   public async fetchBusinessProfile(number: string): Promise<NumberBusiness> {

@@ -4,7 +4,7 @@ import { configService, Log, Rabbitmq } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import * as amqp from 'amqplib/callback_api';
 
-import { EmitData, EventController, EventControllerInterface } from '../event.controller';
+import { EmitData, EventController, EventControllerInterface, isSubscribed } from '../event.controller';
 
 export class RabbitmqController extends EventController implements EventControllerInterface {
   public amqpChannel: amqp.Channel | null = null;
@@ -245,7 +245,7 @@ export class RabbitmqController extends EventController implements EventControll
     };
 
     if (instanceRabbitmq?.enabled && this.amqpChannel) {
-      if (Array.isArray(rabbitmqLocal) && rabbitmqLocal.includes(we)) {
+      if (isSubscribed(rabbitmqLocal, we)) {
         const exchangeName = instanceName ?? rabbitmqExchangeName;
 
         let retry = 0;
@@ -298,7 +298,7 @@ export class RabbitmqController extends EventController implements EventControll
       }
     }
 
-    if (rabbitmqGlobal && rabbitmqEvents[we] && this.amqpChannel) {
+    if (rabbitmqGlobal && isSubscribed(rabbitmqEvents, we) && this.amqpChannel) {
       const exchangeName = rabbitmqExchangeName;
 
       let retry = 0;

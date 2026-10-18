@@ -1,0 +1,31 @@
+{
+  "format": "live-record/1",
+  "forkCommit": "bc522750",
+  "baileysVersion": "7.0.0-rc14",
+  "nodeVersion": "v24.21.0",
+  "waWebVersion": "2.3000.1048596303",
+  "phonePlatform": "smbi",
+  "accountType": "business",
+  "linkMethod": "existing-session",
+  "proxy": {
+    "used": false,
+    "protocol": null
+  },
+  "sockets": 1,
+  "startedAt": "2026-09-27T15:03:37.370Z",
+  "openedAt": "2026-09-27T15:03:39.334Z",
+  "endedAt": null,
+  "checkId": "rig-session",
+  "date": "2026-09-27",
+  "phoneModel": "iPhone 16",
+  "osVersion": "iOS 18.6",
+  "whatsappAppVersion": "WhatsApp Business 25.24",
+  "countryCode": "972",
+  "replay": {
+    "owner": {
+      "id": "972500000000:6@s.whatsapp.net",
+      "lid": "100000000000000:6@lid",
+      "name": "Owner"
+    }
+  }
+}

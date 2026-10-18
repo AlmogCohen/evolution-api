@@ -3,6 +3,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchHistoryDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
@@ -24,6 +25,8 @@ import {
   blockUserSchema,
   contactValidateSchema,
   deleteMessageSchema,
+  fetchHistorySchema,
+  getBase64FromMediaMessageSchema,
   markChatUnreadSchema,
   messageUpSchema,
   messageValidateSchema,
@@ -35,6 +38,7 @@ import {
   profileStatusSchema,
   readMessageSchema,
   updateMessageSchema,
+  verifiedNameSchema,
   whatsappNumberSchema,
 } from '@validate/validate.schema';
 import { RequestHandler, Router } from 'express';
@@ -113,7 +117,7 @@ export class ChatRouter extends RouterBroker {
       .post(this.routerPath('getBase64FromMediaMessage'), ...guards, async (req, res) => {
         const response = await this.dataValidate<getBase64FromMediaMessageDto>({
           request: req,
-          schema: null,
+          schema: getBase64FromMediaMessageSchema,
           ClassRef: getBase64FromMediaMessageDto,
           execute: (instance, data) => chatController.getBase64FromMediaMessage(instance, data),
         });
@@ -198,6 +202,27 @@ export class ChatRouter extends RouterBroker {
           return res.status(HttpStatus.BAD_REQUEST).json({ error: 'remoteJid is a required query parameter' });
         }
         const response = await chatController.findChatByRemoteJid(instance, remoteJid);
+
+        return res.status(HttpStatus.OK).json(response);
+      })
+      // The phone answers later with an ON_DEMAND history batch (messages.set); this only asks.
+      .post(this.routerPath('fetchHistory'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<FetchHistoryDto>({
+          request: req,
+          schema: fetchHistorySchema,
+          ClassRef: FetchHistoryDto,
+          execute: (instance, data) => chatController.fetchHistory(instance, data),
+        });
+
+        return res.status(HttpStatus.CREATED).json(response);
+      })
+      .post(this.routerPath('fetchVerifiedName'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<NumberDto>({
+          request: req,
+          schema: verifiedNameSchema,
+          ClassRef: NumberDto,
+          execute: (instance, data) => chatController.fetchVerifiedName(instance, data),
+        });
 
         return res.status(HttpStatus.OK).json(response);
       })

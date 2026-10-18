@@ -2,6 +2,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchHistoryDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
@@ -84,6 +85,14 @@ export class ChatController {
 
   public async updatePrivacySettings({ instanceName }: InstanceDto, data: PrivacySettingDto) {
     return await this.waMonitor.waInstances[instanceName].updatePrivacySettings(data);
+  }
+
+  public async fetchHistory({ instanceName }: InstanceDto, data: FetchHistoryDto) {
+    return await this.waMonitor.waInstances[instanceName].fetchHistory(data);
+  }
+
+  public async fetchVerifiedName({ instanceName }: InstanceDto, data: NumberDto) {
+    return await this.waMonitor.waInstances[instanceName].fetchVerifiedName(data.number);
   }
 
   public async fetchBusinessProfile({ instanceName }: InstanceDto, data: ProfilePictureDto) {

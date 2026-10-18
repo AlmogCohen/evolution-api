@@ -131,6 +131,43 @@ export const deleteMessageSchema: JSONSchema7 = {
   ...isNotEmpty('id', 'remoteJid', 'participant'),
 };
 
+export const getBase64FromMediaMessageSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    reupload: { type: 'boolean' },
+  },
+};
+
+export const fetchHistorySchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    key: {
+      type: 'object',
+      properties: {
+        id: { type: 'string' },
+        remoteJid: { type: 'string' },
+        fromMe: { type: 'boolean', enum: [true, false] },
+      },
+      required: ['id', 'fromMe', 'remoteJid'],
+      ...isNotEmpty('id', 'remoteJid'),
+    },
+    timestampMs: { type: 'integer', minimum: 1 },
+    count: { type: 'integer', minimum: 1, maximum: 50 },
+  },
+  required: ['key', 'timestampMs'],
+};
+
+export const verifiedNameSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    number: { type: 'string', minLength: 1 },
+  },
+  required: ['number'],
+};
+
 export const profilePictureSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

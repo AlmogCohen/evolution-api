@@ -3,6 +3,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchHistoryDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
@@ -24,6 +25,7 @@ import {
   blockUserSchema,
   contactValidateSchema,
   deleteMessageSchema,
+  fetchHistorySchema,
   getBase64FromMediaMessageSchema,
   markChatUnreadSchema,
   messageUpSchema,
@@ -201,6 +203,17 @@ export class ChatRouter extends RouterBroker {
         const response = await chatController.findChatByRemoteJid(instance, remoteJid);
 
         return res.status(HttpStatus.OK).json(response);
+      })
+      // The phone answers later with an ON_DEMAND history batch (messages.set); this only asks.
+      .post(this.routerPath('fetchHistory'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<FetchHistoryDto>({
+          request: req,
+          schema: fetchHistorySchema,
+          ClassRef: FetchHistoryDto,
+          execute: (instance, data) => chatController.fetchHistory(instance, data),
+        });
+
+        return res.status(HttpStatus.CREATED).json(response);
       })
       // Profile routes
       .post(this.routerPath('fetchBusinessProfile'), ...guards, async (req, res) => {

@@ -4,6 +4,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchHistoryDto,
   getBase64FromMediaMessageDto,
   LastMessage,
   MarkChatUnreadDto,
@@ -1765,6 +1766,9 @@ export class BaileysStartupService extends ChannelStartupService {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
             if (participantJid && contactsMap.has(participantJid)) {
               m.pushName = contactsMap.get(participantJid).name;
+            } else if (m.verifiedBizName) {
+              // A business sends no push name; the name WhatsApp certifies for it, as on a live message.
+              m.pushName = m.verifiedBizName;
             } else if (participantJid) {
               m.pushName = participantJid.split('@')[0];
             }
@@ -5123,6 +5127,17 @@ export class BaileysStartupService extends ChannelStartupService {
     } catch (error) {
       throw new InternalServerErrorException('Error updating privacy settings', error.toString());
     }
+  }
+
+  /**
+   * Ask the phone to send this chat's history again, older than `key` (WhatsApp's
+   * HISTORY_SYNC_ON_DEMAND). The phone answers on its own time with an ON_DEMAND
+   * history batch, forwarded as messages.set; the answer here is only the request's id.
+   */
+  public async fetchHistory({ key, timestampMs, count }: FetchHistoryDto) {
+    const anchor = { remoteJid: key.remoteJid, fromMe: key.fromMe, id: key.id };
+    const requestId = await this.client.fetchMessageHistory(count ?? 50, anchor, timestampMs);
+    return { requestId };
   }
 
   public async fetchBusinessProfile(number: string): Promise<NumberBusiness> {

@@ -19,12 +19,16 @@ import { onUnexpectedError } from '@config/error.config';
 import { Logger } from '@config/logger.config';
 import { ROOT_DIR } from '@config/path.config';
 import * as Sentry from '@sentry/node';
+import { quietSignalSessionLogs } from '@utils/quiet-signal-logs';
 import { ServerUP } from '@utils/server-up';
 import axios from 'axios';
 import compression from 'compression';
 import cors from 'cors';
 import express, { json, NextFunction, Request, Response, urlencoded } from 'express';
 import { join } from 'path';
+
+// libsignal prints whole Signal sessions, private keys among them, to the console.
+quietSignalSessionLogs();
 
 async function initWA() {
   await waMonitor.loadInstance();

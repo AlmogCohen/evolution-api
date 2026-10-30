@@ -402,6 +402,12 @@ export class BaileysStartupService extends ChannelStartupService {
   // How long WhatsApp gets to answer a remove-companion-device before the next connection is asked
   // instead; under logoutInstance's own 10s, so a logout that goes unanswered answers 202.
   private static readonly REMOVE_ANSWER_TIMEOUT_MS = 8_000;
+  // How long a new socket gets for its WebSocket to open. Until it does, nothing else can close it:
+  // ws arms its handshakeTimeout only once the proxy has answered CONNECT, and Baileys starts
+  // connectTimeoutMs and the keepalive only once the WebSocket is open. Behind an exit that accepts
+  // the TCP connection and never answers, a socket waited in 'connecting' for good, with no close
+  // to reconnect (2026-10-29: 9 hours). connectTimeoutMs and a margin.
+  private static readonly CONNECT_DEADLINE_MS = 45_000;
   private reconnectAttempts = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   // The connect under way, so a second one joins it instead of building a second socket.
@@ -1283,8 +1289,11 @@ export class BaileysStartupService extends ChannelStartupService {
     client.ws.on('CB:call', onCall);
     client.ws.on('CB:ack,class:call', onCallAck);
 
+    const stopDeadline = this.connectDeadline(client);
+
     this.detachClient = () => {
       stopProcessing();
+      stopDeadline();
       client.ws.off('CB:call', onCall);
       client.ws.off('CB:ack,class:call', onCallAck);
     };
@@ -1292,6 +1301,38 @@ export class BaileysStartupService extends ChannelStartupService {
     this.phoneNumber = number;
 
     return this.client;
+  }
+
+  /**
+   * End `client` as timed out if its WebSocket has not opened by CONNECT_DEADLINE_MS: its close then
+   * reconnects (or, for a pending logout, retries) like any other. Once the WebSocket is open,
+   * Baileys' own timers take over, so a QR waiting to be scanned is left alone. Returns the undo.
+   */
+  private connectDeadline(client: WASocket) {
+    let timer: NodeJS.Timeout | null = null;
+    const stop = () => {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      client.ws.off('open', stop);
+      client.ev.off('connection.update', onUpdate);
+    };
+    const onUpdate = ({ connection }: Partial<ConnectionState>) => {
+      if (connection === 'close') stop();
+    };
+    client.ws.on('open', stop);
+    client.ev.on('connection.update', onUpdate);
+    timer = setTimeout(() => {
+      stop();
+      if (client !== this.client) return;
+      const seconds = BaileysStartupService.CONNECT_DEADLINE_MS / 1000;
+      this.logger.warn(`The connection did not open within ${seconds}s: ending it to connect again`);
+      Promise.resolve()
+        .then(() => client.end(new Boom('Connect timed out', { statusCode: DisconnectReason.timedOut })))
+        .catch((error) =>
+          this.logger.error({ message: 'Could not end the socket that timed out', error: errorFields(error) }),
+        );
+    }, BaileysStartupService.CONNECT_DEADLINE_MS);
+    return stop;
   }
 
   /**

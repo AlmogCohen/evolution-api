@@ -1,4 +1,6 @@
+import type { AgentConnectOpts } from 'agent-base';
 import { socksDispatcher } from 'fetch-socks';
+import type { ClientRequest } from 'http';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { ProxyAgent } from 'undici';
@@ -10,6 +12,37 @@ type Proxy = {
   protocol: string;
   username?: string;
 };
+
+/**
+ * HttpsProxyAgent, letting go of its connection to the proxy when the request is given up before
+ * the proxy answers CONNECT. HttpsProxyAgent waits for that answer with no limit, and an aborted
+ * request does not end the wait: behind an exit that accepts the connection and never answers,
+ * every connect given up (a socket ended at its deadline) left a connection to the proxy open.
+ * An `https:` proxy (TLS to the proxy itself) is not covered.
+ */
+class ReleasingHttpsProxyAgent extends HttpsProxyAgent<string> {
+  async connect(req: ClientRequest, opts: AgentConnectOpts) {
+    const givenUp = new AbortController();
+    const abort = () => givenUp.abort();
+    req.once('abort', abort);
+    req.once('close', abort);
+    const connectOpts = this.connectOpts;
+    // super.connect opens its connection to the proxy from connectOpts before its first await.
+    this.connectOpts = { ...connectOpts, signal: givenUp.signal };
+    let pending: Promise<any>;
+    try {
+      pending = super.connect(req, opts);
+    } finally {
+      this.connectOpts = connectOpts;
+    }
+    try {
+      return await pending;
+    } finally {
+      req.off('abort', abort);
+      req.off('close', abort);
+    }
+  }
+}
 
 function selectProxyAgent(proxyUrl: string): HttpsProxyAgent<string> | SocksProxyAgent {
   const url = new URL(proxyUrl);
@@ -23,7 +56,7 @@ function selectProxyAgent(proxyUrl: string): HttpsProxyAgent<string> | SocksProx
 
   switch (url.protocol) {
     case PROXY_HTTP_PROTOCOL:
-      return new HttpsProxyAgent(url);
+      return new ReleasingHttpsProxyAgent(url);
     case PROXY_SOCKS_PROTOCOL:
     case PROXY_SOCKS5_PROTOCOL: {
       let urlSocks = '';

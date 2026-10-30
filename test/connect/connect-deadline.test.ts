@@ -11,7 +11,11 @@
 // own timers. A socket replaced, or an instance removed, before the deadline ends nothing.
 import { vi } from 'vitest';
 
-const { socketSpy, realSocket } = vi.hoisted(() => ({ socketSpy: vi.fn(), realSocket: { make: null as any } }));
+const { socketSpy, realSocket, versionFetch } = vi.hoisted(() => ({
+  socketSpy: vi.fn(),
+  realSocket: { make: null as any },
+  versionFetch: { real: false },
+}));
 const tmp = await vi.hoisted(async () => {
   const { mkdtempSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
@@ -26,16 +30,24 @@ vi.mock('baileys', async (importOriginal) => {
   realSocket.make = orig.default;
   return { ...orig, default: socketSpy, makeWASocket: socketSpy };
 });
-// The version fetch has its own timeout and tests; here it answers at once.
-vi.mock('@utils/fetchLatestWaWebVersion', () => ({
-  fetchLatestWaWebVersion: async () => ({ version: [2, 3000, 1], isLatest: true }),
-}));
+// The version fetch goes through the proxy first on every attempt; the fake-socket cases skip it.
+vi.mock('@utils/fetchLatestWaWebVersion', async (importOriginal) => {
+  const orig = await importOriginal<any>();
+  return {
+    ...orig,
+    fetchLatestWaWebVersion: (...args: any[]) =>
+      versionFetch.real
+        ? orig.fetchLatestWaWebVersion(...args)
+        : Promise.resolve({ version: [2, 3000, 1], isLatest: true }),
+  };
+});
 
 import { rmSync } from 'node:fs';
 import net from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 import { WAMonitoringService } from '@api/services/monitor.service';
+import { WA_VERSION_FETCH_TIMEOUT_MS } from '@utils/fetchLatestWaWebVersion';
 import { writeLogoutMarker } from '@utils/logout-marker';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
@@ -85,6 +97,7 @@ beforeEach(() => {
   socketSpy.mockReset();
   socketSpy.mockImplementation((config: any) => realSocket.make(config));
   silent.accepted = 0;
+  versionFetch.real = false;
   // setImmediate and the network stay real; the deadline and the backoff run on fake time.
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
 });
@@ -129,11 +142,24 @@ async function behindSilentProxy() {
 const sockets = () => socketSpy.mock.results.length;
 const latest = () => socketSpy.mock.results[socketSpy.mock.results.length - 1].value;
 
+/**
+ * Attempt `n` through the silent proxy, as production makes it: the version fetch reaches the proxy,
+ * gives up after its 10s and lets go of that connection; then the WebSocket's CONNECT waits.
+ */
+async function attemptThrough(n: number) {
+  await until(() => silent.accepted === 2 * n - 1, `attempt ${n}'s version fetch to reach the proxy`);
+  await advance(WA_VERSION_FETCH_TIMEOUT_MS);
+  await until(() => sockets() === n && silent.accepted === 2 * n, `attempt ${n}'s WebSocket to reach the proxy`);
+  await until(() => silent.open.size === 1, `attempt ${n}'s version fetch to let go of the proxy`);
+}
+
 describe('a connect behind a proxy that never answers', () => {
   it('is ended at the deadline, and the reconnect goes out', async () => {
+    versionFetch.real = true;
     const { service } = await behindSilentProxy();
-    await service.connectToWhatsapp();
-    await until(() => silent.accepted === 1, 'the WebSocket to reach the proxy');
+    const connecting = service.connectToWhatsapp();
+    await attemptThrough(1);
+    await connecting;
     await flush();
     expect(service.connectionStatus.state).toBe('connecting');
 
@@ -149,14 +175,14 @@ describe('a connect behind a proxy that never answers', () => {
 
     // The close reconnects on the backoff (1s for the first attempt): a new socket, a new CONNECT.
     await advance(1_000);
-    await until(() => silent.accepted === 2, 'the reconnect to reach the proxy');
-    expect(sockets()).toBe(2);
+    await attemptThrough(2);
 
     // And that one is held to the same deadline: the outage lasts a minute or two, not hours.
     await advance(DEADLINE);
     await until(() => service.connectionStatus.state === 'close', 'the second close');
+    await until(() => silent.open.size === 0, 'the second WebSocket to let go of the proxy');
     await advance(2_000);
-    await until(() => silent.accepted === 3, 'the second reconnect');
+    await until(() => silent.accepted === 5, 'the second reconnect');
 
     service.shutdown();
   });

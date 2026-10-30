@@ -33,6 +33,7 @@ vi.mock('@utils/fetchLatestWaWebVersion', () => ({
 
 import { rmSync } from 'node:fs';
 import net from 'node:net';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { writeLogoutMarker } from '@utils/logout-marker';
@@ -57,6 +58,8 @@ beforeAll(async () => {
     open.add(s);
     s.on('close', () => open.delete(s));
     s.on('error', () => undefined);
+    // It reads the CONNECT (and sees the client go), and answers nothing.
+    s.resume();
   });
   await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
   silent = {
@@ -99,7 +102,8 @@ async function until(done: () => boolean, what: string) {
   const start = performance.now();
   while (!done()) {
     if (performance.now() - start > 5_000) throw new Error(`timed out waiting for ${what}`);
-    await new Promise((r) => setImmediate(r));
+    // Real time (node:timers is not faked), so a wait does not spin.
+    await sleep(2);
   }
 }
 
@@ -174,7 +178,7 @@ describe('a connect behind a proxy that never answers', () => {
 });
 
 describe('the deadline ends only a socket still waiting for its WebSocket', () => {
-  beforeEach(() => socketSpy.mockImplementation(fakeSocket));
+  beforeEach(() => socketSpy.mockImplementation((config: any) => fakeSocket(config, { wsOpens: false })));
 
   it('leaves a socket whose WebSocket opened (a QR waiting to be scanned)', async () => {
     const { service } = await behindSilentProxy();

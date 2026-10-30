@@ -10,7 +10,11 @@ import P from 'pino';
 
 import { makeService } from './baileys-service';
 
-export function fakeSocket(config?: any) {
+/**
+ * `wsOpens: false` models an exit that never lets the WebSocket open (a proxy that never answers
+ * CONNECT); by default it opens once the caller has attached to it, as it does when WhatsApp is reachable.
+ */
+export function fakeSocket(config?: any, opts: { wsOpens?: boolean } = {}) {
   const ev = makeEventBuffer(P({ level: 'silent' }) as any);
   // ev.process subscriptions still attached: a socket Evolution has let go of should have none.
   let handlers = 0;
@@ -77,6 +81,7 @@ export function fakeSocket(config?: any) {
       onClose.splice(0).forEach((f) => f());
     },
   };
+  if (opts.wsOpens !== false) queueMicrotask(() => void (!closed && sock.ws.emit('open')));
   return sock;
 }
 

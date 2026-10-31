@@ -1878,6 +1878,24 @@ export class BaileysStartupService extends ChannelStartupService {
             this.logger.warn(
               `Message ignored with messageStubParameters: id=${received.key?.id}, chat=${jidKind(received.key?.remoteJid)}, reason=${decryptFailure}`,
             );
+            // Not a messages.upsert, which would store and answer it, but a trace a consumer can keep:
+            // who, where, when and why, never a body or the error's own text
+            // (test/handlers/undecryptable-message.test.ts).
+            const key = { ...received.key };
+            if (key.remoteJid?.includes('@lid') && key.remoteJidAlt) {
+              // The same swap as messages.upsert, so the readable copy a retry brings lands in the same chat.
+              [key.remoteJid, key.remoteJidAlt] = [key.remoteJidAlt, key.remoteJid];
+              key.addressingMode = 'pn';
+            }
+            this.sendDataWebhook(Events.MESSAGES_UNDECRYPTABLE, {
+              key,
+              pushName: received.pushName,
+              messageTimestamp: Long.isLong(received.messageTimestamp)
+                ? received.messageTimestamp.toNumber()
+                : received.messageTimestamp,
+              chatKind: jidKind(key.remoteJid),
+              reason: decryptFailure,
+            });
             continue;
           }
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {

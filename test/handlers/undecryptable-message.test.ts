@@ -60,14 +60,20 @@ const lidDmStub = () =>
     'Bad MAC',
   );
 
-async function deliveredEvents(profile: Profile, message: any) {
-  const { service, ev } = await makeService({ profile });
+async function deliveredEvents(profile: Profile, message: any, settings?: Record<string, any>) {
+  const { service, ev, prisma } = await makeService({ profile });
+  if (settings) await prisma.setting.create({ data: { instanceId: 'inst-1', ...settings } });
   await deliver(service, ev, { 'messages.upsert': { messages: [message], type: 'notify' } });
   return emitted.filter((e) => e.event.startsWith('messages.'));
 }
 
 describe.each<Profile>(['minimal', 'stored'])('a message Evolution cannot decrypt (%s)', (profile) => {
-  beforeEach(() => void emitted.splice(0));
+  beforeEach(async () => {
+    emitted.splice(0);
+    // Which failures were already posted lives in the process-wide cache, as across reconnects.
+    const { LocalCache } = await import('@cache/localcache');
+    LocalCache.localCache.flushAll();
+  });
 
   it('a group message reaches the webhook as messages.undecryptable: key, sender, time, chat kind and reason', async () => {
     const events = await deliveredEvents(profile, groupStub());
@@ -122,5 +128,42 @@ describe.each<Profile>(['minimal', 'stored'])('a message Evolution cannot decryp
       ['messages.undecryptable', 'AC2695000000000000000000000000AA'],
       ['messages.upsert', 'AC2695000000000000000000000000AA'],
     ]);
+    // The same key, so a consumer finds the placeholder in the same chat.
+    expect(events[1].data.key).toEqual(events[0].data.key);
+  });
+
+  it('a DM by @lid: the readable copy comes with the same key as the trace', async () => {
+    const { service, ev } = await makeService({ profile });
+    const stub = lidDmStub();
+    await deliver(service, ev, { 'messages.upsert': { messages: [stub], type: 'notify' } });
+    const { messageStubType, messageStubParameters, ...rest } = stub;
+    void messageStubType;
+    void messageStubParameters;
+    await deliver(service, ev, { 'messages.upsert': { messages: [{ ...rest, message: { conversation: 'hello' } }], type: 'notify' } });
+    const [trace, upsert] = emitted.filter((e) => e.event.startsWith('messages.'));
+    expect([trace.event, upsert.event]).toEqual(['messages.undecryptable', 'messages.upsert']);
+    expect(upsert.data.key).toEqual(trace.data.key);
+  });
+
+  it('a failure Baileys retries is posted once, not once per failed retry', async () => {
+    const { service, ev } = await makeService({ profile });
+    for (let i = 0; i < 3; i++) await deliver(service, ev, { 'messages.upsert': { messages: [groupStub()], type: 'notify' } });
+    expect(emitted.filter((e) => e.event.startsWith('messages.')).map((e) => e.event)).toEqual(['messages.undecryptable']);
+  });
+
+  it('a decrypt error Evolution does not list is still posted, with reason other', async () => {
+    const stub = groupStub();
+    stub.messageStubParameters = ['Missing SignedPreKey'];
+    const events = await deliveredEvents(profile, stub);
+    expect(events.map((e) => [e.event, e.data.reason])).toEqual([['messages.undecryptable', 'other']]);
+  });
+
+  it("a peer message (the owner's own devices talking, never a chat message) is not posted", async () => {
+    const stub = { ...groupStub(), category: 'peer' };
+    expect(await deliveredEvents(profile, stub)).toEqual([]);
+  });
+
+  it('a group message is not posted on an instance that ignores groups, as its readable copy would not be', async () => {
+    expect(await deliveredEvents(profile, groupStub(), { groupsIgnore: true })).toEqual([]);
   });
 });

@@ -105,6 +105,18 @@ describe('media downloads leave through the instance proxy', () => {
     });
   }
 
+  for (const protocol of ['http', 'socks5'] as const) {
+    it(`streamMediaMessage (/chat/streamMediaMessage) goes through a ${protocol} proxy`, async () => {
+      const { service, proxy } = await serviceBehind(protocol);
+      const media = await service.streamMediaMessage({ message: imageMessage() } as any);
+      const chunks: Buffer[] = [];
+      for await (const chunk of media.stream) chunks.push(chunk);
+      expect(Buffer.concat(chunks).equals(PLAIN)).toBe(true);
+      expect(proxy.log).toEqual([tunnelled(protocol)]);
+      expect(cdn.log).toEqual([`GET ${PATH}`]);
+    });
+  }
+
   it('the messages.upsert webhook base64 download goes through the proxy', async () => {
     const { service, ev, proxy } = await serviceBehind('http');
     Object.assign(service.localWebhook, { enabled: true, webhookBase64: true });

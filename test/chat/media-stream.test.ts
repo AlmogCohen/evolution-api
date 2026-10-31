@@ -162,6 +162,8 @@ const post = (body: Record<string, any>) =>
     body: JSON.stringify(body),
   });
 
+/** Never 5000 ms: the spy above turns a 5000 ms timer into 0. */
+const WAIT_MS = 4000;
 const within = <T>(ms: number, promise: Promise<T>) =>
   Promise.race([promise, new Promise<'timed out'>((resolve) => setTimeout(() => resolve('timed out'), ms))]);
 
@@ -177,13 +179,13 @@ describe('a media download can be streamed', () => {
   });
 
   it('the first bytes reach the consumer before WhatsApp has sent the last', async () => {
-    const res = await within(5000, post({ message: document(HELD) }));
+    const res = await within(WAIT_MS, post({ message: document(HELD) }));
     if (res === 'timed out') {
       cdn.release();
       throw new Error('no answer until the whole file had arrived');
     }
     const reader = res.body!.getReader();
-    const first = await within(5000, reader.read());
+    const first = await within(WAIT_MS, reader.read());
     cdn.release();
     expect(first).not.toBe('timed out');
 

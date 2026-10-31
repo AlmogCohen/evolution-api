@@ -18,6 +18,7 @@ import {
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Query } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
+import { BadRequestException } from '@exceptions';
 import { Contact, Message, MessageUpdate } from '@prisma/client';
 
 export class ChatController {
@@ -57,6 +58,15 @@ export class ChatController {
 
   public async getBase64FromMediaMessage({ instanceName }: InstanceDto, data: getBase64FromMediaMessageDto) {
     return await this.waMonitor.waInstances[instanceName].getBase64FromMediaMessage(data);
+  }
+
+  /** Only the Baileys channel can stream a download. */
+  public async streamMediaMessage({ instanceName }: InstanceDto, data: getBase64FromMediaMessageDto) {
+    const instance = this.waMonitor.waInstances[instanceName];
+    if (typeof instance?.streamMediaMessage !== 'function') {
+      throw new BadRequestException('This instance cannot stream a media download');
+    }
+    return await instance.streamMediaMessage(data);
   }
 
   public async fetchMessages({ instanceName }: InstanceDto, query: Query<Message>) {

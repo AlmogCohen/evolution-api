@@ -19,6 +19,7 @@ import {
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Query } from '@api/repository/repository.service';
 import { chatController } from '@api/server.module';
+import { Logger } from '@config/logger.config';
 import { Contact, Message, MessageUpdate } from '@prisma/client';
 import {
   archiveChatSchema,
@@ -42,8 +43,11 @@ import {
   whatsappNumberSchema,
 } from '@validate/validate.schema';
 import { RequestHandler, Router } from 'express';
+import { pipeline } from 'stream';
 
 import { HttpStatus } from './index.router';
+
+const logger = new Logger('ChatRouter');
 
 export class ChatRouter extends RouterBroker {
   constructor(...guards: RequestHandler[]) {
@@ -123,6 +127,26 @@ export class ChatRouter extends RouterBroker {
         });
 
         return res.status(HttpStatus.CREATED).json(response);
+      })
+      // The file itself, as it arrives: never held whole (getBase64FromMediaMessage holds it three
+      // times over). An error before the first byte goes to the error handler like any route's; one
+      // after it can only cut the answer short, which is what tells the consumer it is not whole.
+      .post(this.routerPath('streamMediaMessage'), ...guards, async (req, res) => {
+        const media = await this.dataValidate<getBase64FromMediaMessageDto>({
+          request: req,
+          schema: getBase64FromMediaMessageSchema,
+          ClassRef: getBase64FromMediaMessageDto,
+          execute: (instance, data) => chatController.streamMediaMessage(instance, data),
+        });
+        if (!media) return res.status(204).end();
+
+        res.status(HttpStatus.OK).set({
+          'content-type': 'application/octet-stream',
+          'x-media-mimetype': String(media.mimetype ?? '').replace(/[^\x20-\x7e]/g, ''),
+        });
+        pipeline(media.stream, res, (error) => {
+          if (error) logger.warn(`media stream: outcome=cut_short, error=${error.name ?? 'unknown'}`);
+        });
       })
       // TODO: corrigir updateMessage para medias tambem
       .post(this.routerPath('updateMessage'), ...guards, async (req, res) => {

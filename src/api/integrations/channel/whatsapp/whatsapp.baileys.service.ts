@@ -89,6 +89,7 @@ import { LiveRecorder } from '@utils/live-record/recorder';
 import { errorFields, jidKind, makeBaileysLogger } from '@utils/log-privacy';
 import { readLogoutMarker, writeLogoutMarker } from '@utils/logout-marker';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
+import { streamMediaDownload } from '@utils/media-stream';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
 import { QueryLimiter } from '@utils/queryLimiter';
 import { status } from '@utils/renderStatus';
@@ -4891,7 +4892,23 @@ export class BaileysStartupService extends ChannelStartupService {
     return original;
   }
 
-  public async getBase64FromMediaMessage(data: getBase64FromMediaMessageDto, getBuffer = false) {
+  /**
+   * The decrypted file as it arrives, for POST /chat/streamMediaMessage: the same download as
+   * getBase64FromMediaMessage (the instance's proxy, asking the phone to re-upload an expired file),
+   * never held whole. A failure before the stream is handed back throws as getBase64FromMediaMessage
+   * does; one after it is an error on the stream.
+   */
+  public async streamMediaMessage(
+    data: getBase64FromMediaMessageDto,
+  ): Promise<{ mediaType: string; fileName: string; mimetype: string; stream: Readable } | null> {
+    return (await this.getBase64FromMediaMessage(data, false, 'stream')) as any;
+  }
+
+  public async getBase64FromMediaMessage(
+    data: getBase64FromMediaMessageDto,
+    getBuffer = false,
+    as: 'buffer' | 'stream' = 'buffer',
+  ) {
     // Set once a download is attempted: whether the phone was asked to re-upload an expired file.
     let reupload: MediaReupload | undefined;
     // Set when the re-upload failed: why (reuploadRefusal).
@@ -4955,6 +4972,8 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       let buffer: Buffer;
+      // Set instead of buffer when the file is streamed (streamMediaMessage).
+      let stream: Readable;
       const media = `message=${msg?.key?.id}, chat=${jidKind(msg?.key?.remoteJid)}`;
       // reupload: false downloads only what is still on WhatsApp's servers.
       const askPhone = data?.reupload !== false;
@@ -5023,12 +5042,15 @@ export class BaileysStartupService extends ChannelStartupService {
       // (lib/Utils/messages.js:836) while its CDN fetch sets only output.statusCode
       // (lib/Utils/messages-media.js:304), so it never does. Handing it the request as
       // well would let a Baileys that does ask make a second one.
-      const download = (message: WAMessage) =>
-        downloadMediaMessage(message, 'buffer', this.mediaDownloadOptions()) as Promise<Buffer>;
+      const download = async (message: WAMessage) => {
+        // Not Baileys' own stream, which never ends when the download breaks off (utils/media-stream.ts).
+        if (as === 'stream') stream = await streamMediaDownload(message, this.mediaDownloadOptions());
+        else buffer = (await downloadMediaMessage(message, 'buffer', this.mediaDownloadOptions())) as Buffer;
+      };
 
       try {
         try {
-          buffer = await download(target);
+          await download(target);
         } catch (error) {
           if (!askPhone || !isExpiredMedia(error, link)) throw error;
           let refreshed: WAMessage;
@@ -5038,7 +5060,7 @@ export class BaileysStartupService extends ChannelStartupService {
             // The download's own error stands; the log already says how the re-upload ended.
             throw error;
           }
-          buffer = await download(refreshed);
+          await download(refreshed);
         }
       } catch (error) {
         const status = httpStatus(error);
@@ -5052,20 +5074,28 @@ export class BaileysStartupService extends ChannelStartupService {
         if (!mediaType) throw new Error('Could not determine mediaType for fallback');
 
         try {
-          const media = await downloadContentFromMessage(
-            {
-              mediaKey: msg.message?.[mediaType]?.mediaKey,
-              directPath: msg.message?.[mediaType]?.directPath,
-              url: `https://mmg.whatsapp.net${msg?.message?.[mediaType]?.directPath}`,
-            },
-            await this.mapMediaType(mediaType),
-            this.mediaDownloadOptions(),
-          );
-          const chunks = [];
-          for await (const chunk of media) {
-            chunks.push(chunk);
+          const url = `https://mmg.whatsapp.net${msg?.message?.[mediaType]?.directPath}`;
+          if (as === 'stream') {
+            stream = await streamMediaDownload(
+              { key: msg.key, message: { [mediaType]: { ...msg.message[mediaType], url } } },
+              this.mediaDownloadOptions(),
+            );
+          } else {
+            const media = await downloadContentFromMessage(
+              {
+                mediaKey: msg.message?.[mediaType]?.mediaKey,
+                directPath: msg.message?.[mediaType]?.directPath,
+                url,
+              },
+              await this.mapMediaType(mediaType),
+              this.mediaDownloadOptions(),
+            );
+            const chunks = [];
+            for await (const chunk of media) {
+              chunks.push(chunk);
+            }
+            buffer = Buffer.concat(chunks);
           }
-          buffer = Buffer.concat(chunks);
           this.logger.info('Download Media with downloadContentFromMessage was successful!');
         } catch (fallbackErr) {
           // Its error carries the signed media URL (message and data.url): name and status only.
@@ -5079,6 +5109,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
       const ext = mimeTypes.extension(mediaMessage?.['mimetype']);
       const fileName = mediaMessage?.['fileName'] || `${msg.key.id}.${ext}` || `${v4()}.${ext}`;
+
+      if (as === 'stream') return { mediaType, fileName, mimetype: mediaMessage['mimetype'], stream };
 
       if (convertToMp4 && typeMessage === 'audioMessage') {
         try {

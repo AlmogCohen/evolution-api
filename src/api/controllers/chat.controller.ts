@@ -2,6 +2,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchHistoryDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
@@ -17,6 +18,7 @@ import {
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Query } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
+import { BadRequestException } from '@exceptions';
 import { Contact, Message, MessageUpdate } from '@prisma/client';
 
 export class ChatController {
@@ -58,6 +60,15 @@ export class ChatController {
     return await this.waMonitor.waInstances[instanceName].getBase64FromMediaMessage(data);
   }
 
+  /** Only the Baileys channel can stream a download. */
+  public async streamMediaMessage({ instanceName }: InstanceDto, data: getBase64FromMediaMessageDto) {
+    const instance = this.waMonitor.waInstances[instanceName];
+    if (typeof instance?.streamMediaMessage !== 'function') {
+      throw new BadRequestException('This instance cannot stream a media download');
+    }
+    return await instance.streamMediaMessage(data);
+  }
+
   public async fetchMessages({ instanceName }: InstanceDto, query: Query<Message>) {
     return await this.waMonitor.waInstances[instanceName].fetchMessages(query);
   }
@@ -84,6 +95,14 @@ export class ChatController {
 
   public async updatePrivacySettings({ instanceName }: InstanceDto, data: PrivacySettingDto) {
     return await this.waMonitor.waInstances[instanceName].updatePrivacySettings(data);
+  }
+
+  public async fetchHistory({ instanceName }: InstanceDto, data: FetchHistoryDto) {
+    return await this.waMonitor.waInstances[instanceName].fetchHistory(data);
+  }
+
+  public async fetchVerifiedName({ instanceName }: InstanceDto, data: NumberDto) {
+    return await this.waMonitor.waInstances[instanceName].fetchVerifiedName(data.number);
   }
 
   public async fetchBusinessProfile({ instanceName }: InstanceDto, data: ProfilePictureDto) {

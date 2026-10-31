@@ -1,3 +1,5 @@
+**This is a fork: read the first section of `AGENTS.md` (test first, red then green) before changing anything.**
+
 # CLAUDE.md
 
 This file provides comprehensive guidance to Claude AI when working with the Evolution API codebase.

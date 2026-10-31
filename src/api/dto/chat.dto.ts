@@ -20,6 +20,16 @@ export class OnWhatsAppDto {
 export class getBase64FromMediaMessageDto {
   message: proto.WebMessageInfo;
   convertToMp4?: boolean;
+  /** false: never ask the phone to re-upload a file that has expired on the CDN (default true). */
+  reupload?: boolean;
+}
+
+/** Ask the phone for a chat's history older than `key`, sent at `timestampMs` (WhatsApp's oldestMsgTimestampMs). */
+export class FetchHistoryDto {
+  key: { remoteJid: string; fromMe: boolean; id: string };
+  timestampMs: number;
+  /** At most 50 (WhatsApp Web's own page); 50 when omitted. */
+  count?: number;
 }
 
 export class WhatsAppNumberDto {

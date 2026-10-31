@@ -70,6 +70,7 @@ export type EventsRabbitmq = {
   MESSAGES_SET: boolean;
   MESSAGES_UPSERT: boolean;
   MESSAGES_EDITED: boolean;
+  MESSAGES_UNDECRYPTABLE: boolean;
   MESSAGES_UPDATE: boolean;
   MESSAGES_DELETE: boolean;
   SEND_MESSAGE: boolean;
@@ -141,6 +142,7 @@ export type Sqs = {
     LOGOUT_INSTANCE: boolean;
     MESSAGES_DELETE: boolean;
     MESSAGES_EDITED: boolean;
+    MESSAGES_UNDECRYPTABLE: boolean;
     MESSAGES_SET: boolean;
     MESSAGES_UPDATE: boolean;
     MESSAGES_UPSERT: boolean;
@@ -202,6 +204,7 @@ export type EventsWebhook = {
   MESSAGES_SET: boolean;
   MESSAGES_UPSERT: boolean;
   MESSAGES_EDITED: boolean;
+  MESSAGES_UNDECRYPTABLE: boolean;
   MESSAGES_UPDATE: boolean;
   MESSAGES_DELETE: boolean;
   SEND_MESSAGE: boolean;
@@ -235,6 +238,7 @@ export type EventsPusher = {
   MESSAGES_SET: boolean;
   MESSAGES_UPSERT: boolean;
   MESSAGES_EDITED: boolean;
+  MESSAGES_UNDECRYPTABLE: boolean;
   MESSAGES_UPDATE: boolean;
   MESSAGES_DELETE: boolean;
   SEND_MESSAGE: boolean;
@@ -516,6 +520,7 @@ export class ConfigService {
           MESSAGES_SET: process.env?.RABBITMQ_EVENTS_MESSAGES_SET === 'true',
           MESSAGES_UPSERT: process.env?.RABBITMQ_EVENTS_MESSAGES_UPSERT === 'true',
           MESSAGES_EDITED: process.env?.RABBITMQ_EVENTS_MESSAGES_EDITED === 'true',
+          MESSAGES_UNDECRYPTABLE: process.env?.RABBITMQ_EVENTS_MESSAGES_UNDECRYPTABLE === 'true',
           MESSAGES_UPDATE: process.env?.RABBITMQ_EVENTS_MESSAGES_UPDATE === 'true',
           MESSAGES_DELETE: process.env?.RABBITMQ_EVENTS_MESSAGES_DELETE === 'true',
           SEND_MESSAGE: process.env?.RABBITMQ_EVENTS_SEND_MESSAGE === 'true',
@@ -553,6 +558,7 @@ export class ConfigService {
           MESSAGES_SET: process.env?.NATS_EVENTS_MESSAGES_SET === 'true',
           MESSAGES_UPSERT: process.env?.NATS_EVENTS_MESSAGES_UPSERT === 'true',
           MESSAGES_EDITED: process.env?.NATS_EVENTS_MESSAGES_EDITED === 'true',
+          MESSAGES_UNDECRYPTABLE: process.env?.NATS_EVENTS_MESSAGES_UNDECRYPTABLE === 'true',
           MESSAGES_UPDATE: process.env?.NATS_EVENTS_MESSAGES_UPDATE === 'true',
           MESSAGES_DELETE: process.env?.NATS_EVENTS_MESSAGES_DELETE === 'true',
           SEND_MESSAGE: process.env?.NATS_EVENTS_SEND_MESSAGE === 'true',
@@ -605,6 +611,7 @@ export class ConfigService {
           LOGOUT_INSTANCE: process.env?.SQS_GLOBAL_LOGOUT_INSTANCE === 'true',
           MESSAGES_DELETE: process.env?.SQS_GLOBAL_MESSAGES_DELETE === 'true',
           MESSAGES_EDITED: process.env?.SQS_GLOBAL_MESSAGES_EDITED === 'true',
+          MESSAGES_UNDECRYPTABLE: process.env?.SQS_GLOBAL_MESSAGES_UNDECRYPTABLE === 'true',
           MESSAGES_SET: process.env?.SQS_GLOBAL_MESSAGES_SET === 'true',
           MESSAGES_UPDATE: process.env?.SQS_GLOBAL_MESSAGES_UPDATE === 'true',
           MESSAGES_UPSERT: process.env?.SQS_GLOBAL_MESSAGES_UPSERT === 'true',
@@ -636,6 +643,7 @@ export class ConfigService {
           MESSAGES_SET: process.env?.KAFKA_EVENTS_MESSAGES_SET === 'true',
           MESSAGES_UPSERT: process.env?.KAFKA_EVENTS_MESSAGES_UPSERT === 'true',
           MESSAGES_EDITED: process.env?.KAFKA_EVENTS_MESSAGES_EDITED === 'true',
+          MESSAGES_UNDECRYPTABLE: process.env?.KAFKA_EVENTS_MESSAGES_UNDECRYPTABLE === 'true',
           MESSAGES_UPDATE: process.env?.KAFKA_EVENTS_MESSAGES_UPDATE === 'true',
           MESSAGES_DELETE: process.env?.KAFKA_EVENTS_MESSAGES_DELETE === 'true',
           SEND_MESSAGE: process.env?.KAFKA_EVENTS_SEND_MESSAGE === 'true',
@@ -701,6 +709,7 @@ export class ConfigService {
           MESSAGES_SET: process.env?.PUSHER_EVENTS_MESSAGES_SET === 'true',
           MESSAGES_UPSERT: process.env?.PUSHER_EVENTS_MESSAGES_UPSERT === 'true',
           MESSAGES_EDITED: process.env?.PUSHER_EVENTS_MESSAGES_EDITED === 'true',
+          MESSAGES_UNDECRYPTABLE: process.env?.PUSHER_EVENTS_MESSAGES_UNDECRYPTABLE === 'true',
           MESSAGES_UPDATE: process.env?.PUSHER_EVENTS_MESSAGES_UPDATE === 'true',
           MESSAGES_DELETE: process.env?.PUSHER_EVENTS_MESSAGES_DELETE === 'true',
           SEND_MESSAGE: process.env?.PUSHER_EVENTS_SEND_MESSAGE === 'true',
@@ -758,6 +767,7 @@ export class ConfigService {
           MESSAGES_SET: process.env?.WEBHOOK_EVENTS_MESSAGES_SET === 'true',
           MESSAGES_UPSERT: process.env?.WEBHOOK_EVENTS_MESSAGES_UPSERT === 'true',
           MESSAGES_EDITED: process.env?.WEBHOOK_EVENTS_MESSAGES_EDITED === 'true',
+          MESSAGES_UNDECRYPTABLE: process.env?.WEBHOOK_EVENTS_MESSAGES_UNDECRYPTABLE === 'true',
           MESSAGES_UPDATE: process.env?.WEBHOOK_EVENTS_MESSAGES_UPDATE === 'true',
           MESSAGES_DELETE: process.env?.WEBHOOK_EVENTS_MESSAGES_DELETE === 'true',
           SEND_MESSAGE: process.env?.WEBHOOK_EVENTS_SEND_MESSAGE === 'true',

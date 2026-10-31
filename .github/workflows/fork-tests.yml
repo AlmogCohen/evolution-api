@@ -1,0 +1,81 @@
+# The fork's tests. Every commit on a fork/ branch runs them, so a test:
+# commit shows its red run and the fix: commit after it shows green (FORK.md).
+name: fork tests
+
+on:
+  push:
+    branches: ['fork/**']
+  pull_request:
+  schedule:
+    # Weekly, against the newest Baileys release, so a new version is a
+    # diff to read before anyone bumps the pin.
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: typecheck and tests (pinned Baileys)
+    runs-on: ubuntu-latest
+    # A few tests need what only a real database does (foreign keys, cascades):
+    # they create and drop their own database on this server (test/helpers/real-postgres.ts).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      FORK_TEST_PG_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm run db:generate
+        env:
+          DATABASE_PROVIDER: postgresql
+      - run: npx tsc --noEmit
+      - name: tests
+        run: |
+          expected=$(node -p "require('./package.json').dependencies.baileys")
+          BAILEYS_EXPECT="$expected" npx vitest run
+
+  baileys-latest:
+    name: tests against the newest Baileys
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # A few tests need what only a real database does (foreign keys, cascades):
+    # they create and drop their own database on this server (test/helpers/real-postgres.ts).
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      FORK_TEST_PG_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm install --no-save baileys@latest
+      - run: npm run db:generate
+        env:
+          DATABASE_PROVIDER: postgresql
+      - name: tests
+        run: |
+          installed=$(node -p "require('baileys/package.json').version")
+          echo "Testing baileys $installed"
+          BAILEYS_EXPECT="$installed" npx vitest run

@@ -17,6 +17,18 @@ import { v4 } from 'uuid';
 
 import { ProxyController } from './proxy.controller';
 
+// A logout that could not reach WhatsApp yet: answered 202, and connectionState carries logoutPending: true until it has.
+const LOGOUT_PENDING = {
+  status: 'PENDING',
+  error: false,
+  response: { message: 'Logout pending: WhatsApp will be told when the connection returns' },
+};
+const DELETE_PENDING = {
+  status: 'PENDING',
+  error: false,
+  response: { message: 'Instance deleted; its logout will reach WhatsApp when the connection returns' },
+};
+
 export class InstanceController {
   constructor(
     private readonly waMonitor: WAMonitoringService,
@@ -315,6 +327,11 @@ export class InstanceController {
         throw new BadRequestException('The "' + instanceName + '" instance does not exist');
       }
 
+      // A pending logout owns the connection: answer with that instead of starting a new one.
+      if (instance.logoutPending) {
+        return await this.connectionState({ instanceName });
+      }
+
       if (state == 'open') {
         return await this.connectionState({ instanceName });
       }
@@ -391,10 +408,13 @@ export class InstanceController {
   }
 
   public async connectionState({ instanceName }: InstanceDto) {
+    // A deleted instance whose logout is still on its way to WhatsApp answers here (and only here) until it is.
+    const instance = this.waMonitor.waInstances[instanceName] ?? this.waMonitor.finishingLogouts?.[instanceName];
     return {
       instance: {
         instanceName: instanceName,
-        state: this.waMonitor.waInstances[instanceName]?.connectionStatus?.state,
+        state: instance?.connectionStatus?.state,
+        ...(instance?.logoutPending ? { logoutPending: true } : {}),
       },
     };
   }
@@ -435,13 +455,26 @@ export class InstanceController {
 
   public async logout({ instanceName }: InstanceDto) {
     const { instance } = await this.connectionState({ instanceName });
+    const waInstance = this.waMonitor.waInstances[instanceName];
 
-    if (instance.state === 'close') {
+    // Already pending: answered 202 only once it is recorded (logoutInstance tries again if it was not).
+    if (waInstance?.logoutPending) {
+      try {
+        await waInstance.logoutInstance();
+      } catch (error) {
+        throw new InternalServerErrorException(error.toString());
+      }
+      return LOGOUT_PENDING;
+    }
+
+    // "close" is also an instance whose socket dropped and whose linked session is still stored
+    // (a reconnect waiting): that one is logged out, or its reconnect brings the session back.
+    if (instance.state === 'close' && !(await waInstance?.hasSessionToLogOut?.())) {
       throw new BadRequestException('The "' + instanceName + '" instance is not connected');
     }
 
     try {
-      await this.waMonitor.waInstances[instanceName]?.logoutInstance();
+      if ((await waInstance?.logoutInstance()) === 'pending') return LOGOUT_PENDING;
 
       return { status: 'SUCCESS', error: false, response: { message: 'Instance logged out' } };
     } catch (error) {
@@ -455,8 +488,34 @@ export class InstanceController {
       const waInstances = this.waMonitor.waInstances[instanceName];
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
-      if (instance.state === 'connecting' || instance.state === 'open') {
-        await this.logout({ instanceName });
+      let pending = !!waInstances?.logoutPending;
+      if (
+        !pending &&
+        (instance.state === 'connecting' || instance.state === 'open' || (await waInstances?.hasSessionToLogOut?.()))
+      ) {
+        try {
+          pending = (await this.logout({ instanceName }))?.status === 'PENDING';
+        } catch (error) {
+          // Pending but not recorded: deleting now would wipe the creds the logout needs.
+          if (waInstances?.logoutPending) throw error;
+          // A failed logout must not stop the delete. The remove.instance emit
+          // below is the only path that purges the in-memory entry and runs
+          // cleaningUp() and cleaningStoreData(), which wipe the session again.
+          // Without this catch, the stale entry persists until the entire
+          // process restarts.
+          this.logger.warn({
+            message: 'logout failed during deleteInstance, proceeding with cleanup',
+            instanceName,
+            error,
+          });
+        }
+      }
+
+      // The logout has not reached WhatsApp: the instance leaves the API now, keeping only what the
+      // logout needs, and finishes it in the background (WAMonitoringService.deleteKeepingLogout).
+      if (pending) {
+        await this.waMonitor.deleteKeepingLogout(instanceName);
+        return DELETE_PENDING;
       }
 
       try {
@@ -471,6 +530,11 @@ export class InstanceController {
       this.eventEmitter.emit('remove.instance', instanceName, 'inner');
       return { status: 'SUCCESS', error: false, response: { message: 'Instance deleted' } };
     } catch (error) {
+      if (error instanceof InternalServerErrorException) throw error;
+      // A pending logout that could not be recorded as deleted: the instance stays, and so does its logout.
+      if (this.waMonitor.waInstances[instanceName]?.logoutPending) {
+        throw new InternalServerErrorException(error.toString());
+      }
       throw new BadRequestException(error.toString());
     }
   }

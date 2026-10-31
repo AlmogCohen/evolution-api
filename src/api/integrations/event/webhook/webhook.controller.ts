@@ -8,7 +8,7 @@ import { Logger } from '@config/logger.config';
 import axios, { AxiosInstance } from 'axios';
 import * as jwt from 'jsonwebtoken';
 
-import { EmitData, EventController, EventControllerInterface } from '../event.controller';
+import { EmitData, EventController, EventControllerInterface, isSubscribed } from '../event.controller';
 
 export class WebhookController extends EventController implements EventControllerInterface {
   private readonly logger = new Logger('WebhookController');
@@ -103,7 +103,7 @@ export class WebhookController extends EventController implements EventControlle
     };
 
     if (local && instance?.enabled) {
-      if (Array.isArray(webhookLocal) && webhookLocal.includes(we)) {
+      if (isSubscribed(webhookLocal, we)) {
         let baseURL: string;
 
         if (instance?.webhookByEvents) {
@@ -150,7 +150,7 @@ export class WebhookController extends EventController implements EventControlle
     }
 
     if (webhookConfig.GLOBAL?.ENABLED) {
-      if (webhookConfig.EVENTS[we]) {
+      if (isSubscribed(webhookConfig.EVENTS, we)) {
         let globalURL = webhookConfig.GLOBAL.URL;
 
         if (webhookConfig.GLOBAL.WEBHOOK_BY_EVENTS) {

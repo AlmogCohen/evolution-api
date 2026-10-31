@@ -151,6 +151,15 @@ describe.each<Profile>(['minimal', 'stored'])('a message Evolution cannot decryp
     expect(emitted.filter((e) => e.event.startsWith('messages.')).map((e) => e.event)).toEqual(['messages.undecryptable']);
   });
 
+  it("the owner's own message and someone else's with the same id in one chat are two failures, each posted", async () => {
+    const { service, ev } = await makeService({ profile });
+    const theirs = groupStub();
+    const mine = { ...groupStub(), key: { ...groupStub().key, fromMe: true } };
+    await deliver(service, ev, { 'messages.upsert': { messages: [theirs], type: 'notify' } });
+    await deliver(service, ev, { 'messages.upsert': { messages: [mine], type: 'notify' } });
+    expect(emitted.filter((e) => e.event === 'messages.undecryptable').map((e) => e.data.key.fromMe)).toEqual([false, true]);
+  });
+
   it('a decrypt error Evolution does not list is still posted, with reason other', async () => {
     const stub = groupStub();
     stub.messageStubParameters = ['Missing SignedPreKey'];

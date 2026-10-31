@@ -1890,7 +1890,7 @@ export class BaileysStartupService extends ChannelStartupService {
             // the readable copy would be dropped too; and once per message, not once per failed retry.
             const group = received.key?.remoteJid?.includes('@g.us');
             if ((received as any).category !== 'peer' && !(settings?.groupsIgnore && group)) {
-              const traced = `undecryptable_${this.instanceId}_${received.key?.remoteJid}_${received.key?.id}`;
+              const traced = `undecryptable_${this.instanceId}_${received.key?.remoteJid}_${received.key?.fromMe ? 1 : 0}_${received.key?.id}`;
               if (!(await this.baileysCache.get(traced))) {
                 await this.baileysCache.set(traced, true, 60 * 60 * 24);
                 const key = { ...received.key };

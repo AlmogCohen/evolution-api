@@ -155,6 +155,7 @@ export class EventController {
     'MESSAGES_SET',
     'MESSAGES_UPSERT',
     'MESSAGES_EDITED',
+    'MESSAGES_UNDECRYPTABLE',
     'MESSAGES_UPDATE',
     'MESSAGES_DELETE',
     'SEND_MESSAGE',

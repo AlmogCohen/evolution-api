@@ -1874,28 +1874,42 @@ export class BaileysStartupService extends ChannelStartupService {
             'No session found to decrypt message',
             'Message absent from node',
           ].find((err) => received?.messageStubParameters?.some?.((param) => param?.includes?.(err)));
-          if (decryptFailure) {
+          // Any CIPHERTEXT stub is a message Baileys could not decrypt, whatever its error says
+          // (libsignal has more than the list above, "Missing SignedPreKey" among them).
+          const undecrypted =
+            !received?.message && received?.messageStubType === proto.WebMessageInfo.StubType.CIPHERTEXT;
+          if (decryptFailure || undecrypted) {
+            const reason = decryptFailure ?? 'other';
             this.logger.warn(
-              `Message ignored with messageStubParameters: id=${received.key?.id}, chat=${jidKind(received.key?.remoteJid)}, reason=${decryptFailure}`,
+              `Message ignored with messageStubParameters: id=${received.key?.id}, chat=${jidKind(received.key?.remoteJid)}, reason=${reason}`,
             );
             // Not a messages.upsert, which would store and answer it, but a trace a consumer can keep:
             // who, where, when and why, never a body or the error's own text
-            // (test/handlers/undecryptable-message.test.ts).
-            const key = { ...received.key };
-            if (key.remoteJid?.includes('@lid') && key.remoteJidAlt) {
-              // The same swap as messages.upsert, so the readable copy a retry brings lands in the same chat.
-              [key.remoteJid, key.remoteJidAlt] = [key.remoteJidAlt, key.remoteJid];
-              key.addressingMode = 'pn';
+            // (test/handlers/undecryptable-message.test.ts). Not for a peer message (the owner's devices
+            // talking to each other, never a chat message), nor in a group the instance ignores, where
+            // the readable copy would be dropped too; and once per message, not once per failed retry.
+            const group = received.key?.remoteJid?.includes('@g.us');
+            if ((received as any).category !== 'peer' && !(settings?.groupsIgnore && group)) {
+              const traced = `undecryptable_${this.instanceId}_${received.key?.remoteJid}_${received.key?.id}`;
+              if (!(await this.baileysCache.get(traced))) {
+                await this.baileysCache.set(traced, true, 60 * 60 * 24);
+                const key = { ...received.key };
+                if (key.remoteJid?.includes('@lid') && key.remoteJidAlt) {
+                  // The same swap as messages.upsert, so the readable copy a retry brings lands in the same chat.
+                  [key.remoteJid, key.remoteJidAlt] = [key.remoteJidAlt, key.remoteJid];
+                  key.addressingMode = 'pn';
+                }
+                this.sendDataWebhook(Events.MESSAGES_UNDECRYPTABLE, {
+                  key,
+                  pushName: received.pushName,
+                  messageTimestamp: Long.isLong(received.messageTimestamp)
+                    ? received.messageTimestamp.toNumber()
+                    : received.messageTimestamp,
+                  chatKind: jidKind(key.remoteJid),
+                  reason,
+                });
+              }
             }
-            this.sendDataWebhook(Events.MESSAGES_UNDECRYPTABLE, {
-              key,
-              pushName: received.pushName,
-              messageTimestamp: Long.isLong(received.messageTimestamp)
-                ? received.messageTimestamp.toNumber()
-                : received.messageTimestamp,
-              chatKind: jidKind(key.remoteJid),
-              reason: decryptFailure,
-            });
             continue;
           }
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
